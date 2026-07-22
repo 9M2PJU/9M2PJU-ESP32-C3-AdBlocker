@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-C3 AdBlocker — Web Flasher</title>
+<style>
+body{font:15px system-ui,-apple-system,sans-serif;margin:0;background:#0d1117;color:#c9d1d9;line-height:1.6}
+.wrap{max-width:680px;margin:0 auto;padding:24px 20px 60px}
+h1{font-size:26px;margin:0 0 4px}
+h1 span{color:#3fb950}
+.sub{color:#8b949e;font-size:15px;margin-bottom:24px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;margin-bottom:18px}
+.card h2{font-size:17px;margin:0 0 12px;color:#c9d1d9}
+.card ol{margin:0;padding-left:20px}
+.card li{margin-bottom:8px}
+.card li b{color:#3fb950}
+.flash-box{text-align:center;padding:30px 20px;background:#161b22;border:1px solid #30363d;border-radius:10px;margin-bottom:18px}
+.flash-box p{color:#8b949e;margin:12px 0 0}
+esp-web-install-button{--esp-button-color:#238636;--esp-button-text-color:#fff;--esp-button-hover-color:#2ea043}
+.warn{background:#1c2128;border:1px solid #f8514940;border-radius:8px;padding:12px 16px;margin-bottom:18px;color:#f85149;font-size:14px}
+.warn b{color:#f85149}
+.info{background:#1c2128;border:1px solid #30363d;border-radius:8px;padding:12px 16px;margin-bottom:18px;font-size:14px;color:#8b949e}
+.info b{color:#c9d1d9}
+a{color:#58a6ff;text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:#21262d;border-radius:4px;padding:2px 6px;font-size:13px}
+.footer{text-align:center;color:#484f58;font-size:13px;margin-top:30px}
+.steps{counter-reset:step}
+.step{display:flex;gap:14px;margin-bottom:16px}
+.step-num{flex-shrink:0;width:28px;height:28px;border-radius:50%;background:#238636;color:#fff;font-weight:600;font-size:14px;display:flex;align-items:center;justify-content:center}
+.step-body{flex:1}
+.step-body b{color:#c9d1d9}
+.step-body p{margin:4px 0 0;color:#8b949e;font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>ESP32-C3 <span>AdBlocker</span></h1>
+<p class="sub">Flash directly from your browser — no software install needed.</p>
+
+<div class="flash-box">
+<esp-web-install-button manifest="manifest.yml"></esp-web-install-button>
+<p>Click <b>CONNECT</b> and select your ESP32-C3's serial port.</p>
+</div>
+
+<div class="warn">
+<b>Requires Chrome or Edge.</b> The Web Serial API used by this flasher is only
+available in Chromium-based browsers (Chrome, Edge, Opera, Brave). Firefox and
+Safari are not supported.
+</div>
+
+<div class="card">
+<h2>How to flash</h2>
+<div class="steps">
+<div class="step">
+<div class="step-num">1</div>
+<div class="step-body">
+<b>Plug in your ESP32-C3 via USB</b>
+<p>Use a data cable (not charge-only). The board should appear as a serial port.</p>
+</div>
+</div>
+<div class="step">
+<div class="step-num">2</div>
+<div class="step-body">
+<b>Click CONNECT above</b>
+<p>The browser will ask permission to access the serial port. Select your ESP32-C3
+(typically <code>USB JTAG/serial debug unit</code> or <code>USB Serial Port</code>) and click Connect.</p>
+</div>
+</div>
+<div class="step">
+<div class="step-num">3</div>
+<div class="step-body">
+<b>Choose "Install" and erase</b>
+<p>ESP Web Tools will erase the flash and write the bootloader, partition table,
+firmware, and blocklist (~140k domains). This takes about 30–60 seconds.</p>
+</div>
+</div>
+<div class="step">
+<div class="step-num">4</div>
+<div class="step-body">
+<b>Wait for the "Done!" message</b>
+<p>Then click <b>Visit Logs</b> or close the dialog. The board will reboot.</p>
+</div>
+</div>
+<div class="step">
+<div class="step-num">5</div>
+<div class="step-body">
+<b>Set up WiFi</b>
+<p>The board starts a captive portal AP called <code>C3AdBlock-Setup</code>.
+Connect to it from your phone/laptop, open <code>http://192.168.4.1</code>,
+and enter your WiFi credentials.</p>
+</div>
+</div>
+<div class="step">
+<div class="step-num">6</div>
+<div class="step-body">
+<b>Open the dashboard</b>
+<p>Once on your WiFi, go to <code>http://c3adblock.local</code> (or the IP shown
+on serial). The username is anything; the password is printed on the serial console
+at boot (look for <code>[cfg] dashboard password:</code>).</p>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card">
+<h2>What gets flashed</h2>
+<ol>
+<li><b>Bootloader</b> (offset <code>0x1000</code>) — ESP32-C3 bootloader</li>
+<li><b>Partition table</b> (offset <code>0x8000</code>) — dual-OTA + LittleFS layout</li>
+<li><b>Firmware</b> (offset <code>0x10000</code>) — the ad-blocker application</li>
+<li><b>Blocklist filesystem</b> (offset <code>0x2b0000</code>) — ~140k blocked domains
+(StevenBlack + Hagezi Light, WhatsApp/social safe)</li>
+</ol>
+<p style="color:#8b949e;font-size:14px;margin-bottom:0">
+After the initial flash, all updates (firmware + blocklist) happen over WiFi
+from the dashboard — no USB needed.
+</p>
+</div>
+
+<div class="info">
+<b>Troubleshooting:</b><br>
+&bull; <b>Port not showing up?</b> Try a different USB cable (must be data, not
+charge-only). On Linux, you may need to add a udev rule:
+<code>echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", MODE="0666"'</code> to
+<code>/etc/udev/rules.d/99-esp.rules</code>, then <code>sudo udevadm control --reload-rules</code>.<br>
+&bull; <b>Flash failed?</b> Hold the BOOT button on the C3 while clicking Connect,
+then release after flashing starts.<br>
+&bull; <b>ModemManager interfering? (Linux)</b>
+<code>sudo systemctl stop ModemManager</code>
+</div>
+
+<div class="footer">
+ESP32-C3 AdBlocker &middot;
+<a href="https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker">GitHub</a> &middot;
+<a href="https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases">Releases</a> &middot;
+Powered by <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>
+</div>
+</div>
+
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+</body>
+</html>
