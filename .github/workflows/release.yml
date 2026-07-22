@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Create stub secrets.h
+        run: cp src/secrets.example.h src/secrets.h
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Run blocklist tests
+        run: python3 tools/test_build_blocklist.py
+
+      - name: Build default blocklist (StevenBlack + Hagezi Light, ~140k domains)
+        run: |
+          mkdir -p data
+          python3 tools/build_blocklist.py data/blocklist.bin
+
+      - name: Build filesystem image
+        run: pio run -t buildfs
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp .pio/build/c3/firmware.bin release/firmware.bin
+          cp .pio/build/c3/bootloader.bin release/bootloader.bin
+          cp .pio/build/c3/partitions.bin release/partitions.bin
+          cp .pio/build/c3/littlefs.bin release/blocklist-fs.bin
+          cp data/blocklist.bin release/blocklist.bin
+          # Combined flashable image (bootloader + partitions + firmware + fs)
+          # Offsets must match partitions.csv:
+          #   bootloader: 0x1000 (esptool default for C3)
+          #   partitions: 0x8000
+          #   firmware:   0x10000
+          #   fs:         0x2b0000
+          ESPTOOL=$(find ~/.platformio/packages -name esptool.py -path '*tool-esptoolpy*' | head -1)
+          python3 "$ESPTOOL" --chip esp32c3 merge_bin -o release/full-flash.bin \
+            --flash_mode dio --flash_size 4MB \
+            0x1000 release/bootloader.bin \
+            0x8000 release/partitions.bin \
+            0x10000 release/firmware.bin \
+            0x2b0000 release/blocklist-fs.bin
+          ls -lh release/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/firmware.bin
+            release/bootloader.bin
+            release/partitions.bin
+            release/blocklist-fs.bin
+            release/blocklist.bin
+            release/full-flash.bin

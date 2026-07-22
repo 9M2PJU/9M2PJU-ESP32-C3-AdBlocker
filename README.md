@@ -136,48 +136,162 @@ Printing notes:
   near it, or your RSSI will suffer.
 - Leave the vents open: the board idles around 45–55 °C.
 
-## Build & flash (PlatformIO)
+## Installation
 
-One USB flash to get going — after that, **firmware and blocklist both update over WiFi** (see below).
+There are two ways to install: **prebuilt release** (easiest, no build tools
+needed) or **build from source** (for customization).
+
+### Option A: Flash a prebuilt release (recommended for most users)
+
+1. **Download the latest release** from
+   [GitHub Releases](https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases).
+   You need:
+   - `full-flash.bin` — everything in one file (bootloader + partitions + firmware
+     + blocklist). This is the easiest option.
+   - **or** the individual files: `bootloader.bin`, `partitions.bin`,
+     `firmware.bin`, `blocklist-fs.bin` (use these if your flash tool doesn't
+     support merged images).
+   - `blocklist.bin` — optional, the prebuilt blocklist (~140k domains). Already
+     included in `full-flash.bin` and `blocklist-fs.bin`, but you can download it
+     separately to update later over WiFi.
+
+2. **Install esptool** (the ESP32 flash tool):
+   ```bash
+   pip install esptool
+   # or on Debian/Ubuntu: sudo apt install esptool
+   ```
+
+3. **Plug in the ESP32-C3** via USB. Find the serial port:
+   ```bash
+   ls /dev/ttyACM* /dev/ttyUSB*    # Linux
+   # macOS: ls /dev/cu.usb*
+   # Windows: check Device Manager for COM ports
+   ```
+
+4. **Flash the full image** (one command, writes everything to 0x0):
+   ```bash
+   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
+     write_flash 0x0 full-flash.bin
+   ```
+   Replace `/dev/ttyACM0` with your port.
+
+   **Or flash the individual files** (if `full-flash.bin` doesn't work for you):
+   ```bash
+   esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
+     write_flash \
+     0x1000   bootloader.bin \
+     0x8000   partitions.bin \
+     0x10000  firmware.bin \
+     0x2b0000 blocklist-fs.bin
+   ```
+
+5. **Continue to first-boot setup** below.
+
+### Option B: Build from source (for customization)
+
+You need [PlatformIO](https://platformio.org/) and Python 3.
+
+1. **Install PlatformIO:**
+   ```bash
+   pip install platformio
+   # or use the standalone installer: https://docs.platformio.org/en/latest/core/installation/
+   ```
+
+2. **Clone this repo:**
+   ```bash
+   git clone https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker.git
+   cd 9M2PJU-ESP32-C3-AdBlocker
+   ```
+
+3. **(Optional) set WiFi creds via secrets.h** — or skip and use the captive
+   portal on first boot:
+   ```bash
+   cp src/secrets.example.h src/secrets.h
+   # edit src/secrets.h -> WIFI_SSID / WIFI_PASS
+   ```
+
+4. **Build the blocklist** (default = StevenBlack base + Hagezi Light, ~140k
+   domains, WhatsApp/social safe):
+   ```bash
+   mkdir -p data
+   python3 tools/build_blocklist.py data/blocklist.bin
+   ```
+   See `tools/build_blocklist.py --help` for custom lists and Bloom filter sizing.
+
+5. **Flash firmware + blocklist filesystem** (the one and only USB flash):
+   ```bash
+   pio run -t upload
+   pio run -t uploadfs
+   ```
+
+6. **Continue to first-boot setup** below.
+
+### First-boot setup
+
+1. **Watch the serial console** (optional but helpful — shows the auth password
+   and IP):
+   ```bash
+   pio device monitor          # if you built from source
+   # or
+   esptool.py --port /dev/ttyACM0 monitor    # prebuilt, may not work
+   # or use screen/minicom at 115200 baud
+   screen /dev/ttyACM0 115200
+   ```
+
+2. **WiFi setup:**
+   - If you set `secrets.h` or flashed a prebuilt image, the device starts a
+     captive portal AP called **C3AdBlock-Setup**.
+   - Connect to it from your phone or laptop, then open
+     **http://192.168.4.1** (it may pop up automatically).
+   - Enter your WiFi name and password, click **Connect**.
+   - The device saves your credentials, reboots, and joins your WiFi.
+
+3. **Find the dashboard password:**
+   - On the serial console, look for:
+     ```
+     [cfg] dashboard password: xY7kPm2nQa
+     ```
+   - Write this down. You can also find it later in the LittleFS file `/auth.cfg`.
+
+4. **Open the dashboard:**
+   - Go to **http://c3adblock.local** in a browser (mDNS).
+   - If that doesn't work (some networks block mDNS), use the IP address shown
+     on the serial console, e.g. `http://192.168.1.42`.
+   - You'll get a Basic Auth prompt. Enter any username and the password from
+     step 3.
+
+### Pointing your devices at the ad-blocker
+
+You have three options:
+
+**Option 1: Manual DNS (simplest, no DHCP changes)**
+- Set your device's DNS server to the C3's IP address.
+- On most OSes: Settings → Network → DNS → Custom → enter the C3's IP.
+- Test: `dig @<c3-ip> doubleclick.net` should return `0.0.0.0`.
+
+**Option 2: Router DNS (whole-network, recommended)**
+- In your router's DHCP settings, set the primary DNS server to the C3's IP.
+- Set the secondary DNS to a real resolver (e.g. `1.1.1.1`) as a fallback.
+- Every device on your network now uses the C3 for DNS automatically.
+
+**Option 3: Built-in DHCP server (true plug-and-play)**
+- **Disable your router's DHCP server first** (having two DHCP servers on one
+  network causes conflicts).
+- In the C3 dashboard, scroll to **DHCP SERVER** and click **Enable / Disable DHCP**.
+- The C3 now hands out IP addresses and tells every device to use itself as DNS.
+- Reconnect your devices (or reboot them) so they pick up the new DHCP lease.
+
+### Testing
 
 ```bash
-# 1. (optional) set WiFi creds via secrets.h — or skip and use the captive portal
-cp src/secrets.example.h src/secrets.h
-#    then edit src/secrets.h -> WIFI_SSID / WIFI_PASS
-#    (if you skip this, the device starts a setup AP on first boot)
-
-# 2. build the blocklist hash table (default = StevenBlack base + Hagezi Light,
-#    ~140k domains, WhatsApp/social safe)
-python3 tools/build_blocklist.py data/blocklist.bin
-
-# 3. flash firmware + the blocklist filesystem (the one and only USB flash)
-pio run -t upload
-pio run -t uploadfs
-
-# 4. watch it boot, note the IP / auth password / open the dashboard
-pio device monitor          # -> http://c3adblock.local
+dig @<c3-ip> doubleclick.net        # -> 0.0.0.0  (blocked, A record)
+dig @<c3-ip> doubleclick.net AAAA   # -> ::       (blocked, AAAA record)
+dig @<c3-ip> github.com             # -> real IP  (forwarded)
+dig @<c3-ip> github.com AAAA        # -> real IPv6 (forwarded)
 ```
 
-### First-boot WiFi setup (captive portal)
-
-If you don't create `secrets.h` (or the credentials are wrong), the device starts
-an AP called **C3AdBlock-Setup**. Connect to it and open
-**http://192.168.4.1** to enter your WiFi credentials. The device saves them,
-reboots, and joins your network. You can change WiFi later from the dashboard.
-
-### Dashboard authentication
-
-On first boot, a random password is generated and saved to flash. It's printed
-on the serial console:
-
-```
-[cfg] dashboard password: xY7kPm2nQa
-```
-
-Open `http://c3adblock.local` in a browser — you'll get a Basic Auth prompt.
-Enter any username and that password. All mutating actions (ban, add domain,
-upload, firmware OTA) also require a CSRF token that's embedded in the dashboard
-page, so a malicious site on your LAN can't CSRF your ad-blocker.
+You should also see the blocked/allowed counts go up in the dashboard, and the
+querying device appear in the **CLIENTS** table.
 
 ## Over-the-air updates (no more USB)
 
@@ -200,18 +314,6 @@ The dashboard at **http://c3adblock.local** does it all:
 **4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
 blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
 single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
-
-## Use it
-
-Point a device's DNS at the C3's IP, or add it as a **secondary resolver** behind
-your main DNS. For true plug-and-play, enable the **DHCP server** from the dashboard
-(disable your router's DHCP first). Test:
-
-```bash
-dig @<c3-ip> doubleclick.net   # -> 0.0.0.0  (blocked, A)
-dig @<c3-ip> doubleclick.net AAAA  # -> ::  (blocked, AAAA — no IPv6 leak)
-dig @<c3-ip> github.com        # -> real IP  (forwarded)
-```
 
 ## How domain matching works
 
@@ -271,6 +373,31 @@ Collisions are reported to `blocklist.bin.collisions.txt` by the build script.
 ```bash
 python3 tools/test_build_blocklist.py    # 33 tests: hashing, normalization, binary format, bloom
 ```
+
+CI runs automatically on every push and PR via `.github/workflows/ci.yml` —
+builds the firmware, runs the tests, and uploads the artifacts.
+
+## Releasing
+
+Releases are published automatically when a tag is pushed:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The release workflow (`.github/workflows/release.yml`) builds the firmware +
+blocklist, creates a merged `full-flash.bin`, and publishes them to GitHub
+Releases with auto-generated release notes. Assets:
+
+| File | Description |
+|---|---|
+| `full-flash.bin` | Merged image — flash to `0x0` with `esptool.py write_flash 0x0 full-flash.bin` |
+| `firmware.bin` | Firmware only — for OTA updates via the dashboard |
+| `bootloader.bin` | Bootloader (rarely needed separately) |
+| `partitions.bin` | Partition table (rarely needed separately) |
+| `blocklist-fs.bin` | LittleFS image with the prebuilt blocklist |
+| `blocklist.bin` | Prebuilt blocklist (~140k domains) — for OTA blocklist updates |
 
 ## Done / how it could grow
 
