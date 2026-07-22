@@ -138,10 +138,23 @@ Printing notes:
 
 ## Installation
 
-There are two ways to install: **prebuilt release** (easiest, no build tools
-needed) or **build from source** (for customization).
+There are three ways to install: **web flasher** (easiest, browser-only),
+**prebuilt release** (esptool CLI), or **build from source** (PlatformIO).
 
-### Option A: Flash a prebuilt release (recommended for most users)
+### Option A: Web flasher (recommended — no software install)
+
+1. Open **https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/** in
+   **Chrome or Edge** (Web Serial API required — Firefox/Safari not supported).
+2. Plug in your ESP32-C3 via USB.
+3. Click **CONNECT**, select your ESP32-C3's serial port.
+4. Choose **Install** — the browser erases the flash and writes the bootloader,
+   partition table, firmware, and blocklist (~140k domains) in ~30–60 seconds.
+5. Continue to [first-boot setup](#first-boot-setup) below.
+
+The web flasher always serves the latest release automatically — no need to
+download anything manually.
+
+### Option B: Flash a prebuilt release with esptool (CLI)
 
 1. **Download the latest release** from
    [GitHub Releases](https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases).
@@ -187,7 +200,7 @@ needed) or **build from source** (for customization).
 
 5. **Continue to first-boot setup** below.
 
-### Option B: Build from source (for customization)
+### Option C: Build from source (for customization)
 
 You need [PlatformIO](https://platformio.org/) and Python 3.
 
