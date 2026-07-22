@@ -1,5 +1,9 @@
 # 9M2PJU-ESP32-C3-AdBlocker
 
+<p align="center">
+  <img src="docs/banner.jpg" alt="9M2PJU ESP32-C3 AdBlocker" width="100%">
+</p>
+
 A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
