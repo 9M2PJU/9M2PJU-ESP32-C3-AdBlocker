@@ -10,3 +10,4 @@ src/secrets.h
 
 # Backups / scratch
 *.bak
+tools/__pycache__/

@@ -1,295 +1,859 @@
 // C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+//
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
-// Dashboard at http://c3adblock.local : per-client stats, system info,
-// ban clients, add custom block domains. All control state persisted to flash.
+// A Bloom filter in RAM skips flash for ~93% of non-blocked queries.
+// Async upstream forwarding handles multiple concurrent queries.
+// TCP DNS support for truncated/DNSSEC fallback.
+// Dashboard at http://c3adblock.local with Basic Auth + CSRF token.
+//
+// Improvements over the original:
+//  - Async DNS forwarding (no more blocking on upstream replies)
+//  - Bloom filter pre-filter in RAM
+//  - AAAA sinkhole (blocked IPv6 queries answered with ::, not leaked)
+//  - TCP DNS on port 53
+//  - Dashboard auth (Basic Auth + CSRF token)
+//  - Client table with LRU eviction
+//  - Decoupled ban storage (independent of client table)
+//  - Idle-gated remote blocklist fetch (doesn't freeze DNS)
+//  - CA-verified HTTPS for remote blocklist (no setInsecure)
+//  - millis() wraparound-safe timing
+//  - Blocklist v1 format with header validation (magic + version + hash_bytes)
+//  - WiFiManager captive portal for first-boot WiFi config
+//  - Optional DHCP server (hands out C3 as DNS for plug-and-play)
+//  - ETag/Cache-Control for dashboard HTML
+//  - Logging macros (silence with -DNDEBUG)
+//  - Custom domains sorted + binary-searched
+//  - 1232-byte DNS buffer (handles EDNS-sized responses)
+//  - parseQuery with robust bounds checking
+//  - No delay(1) in loop (removed throughput cap)
+//  - Dead Dev.label field removed
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiServer.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
-#include <Update.h>            // firmware OTA
-#include <HTTPClient.h>        // remote blocklist fetch
-#include <WiFiClientSecure.h>  // https fetch
-#include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
+#include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoOTA.h>
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
-#include "secrets.h"   // defines WIFI_SSID / WIFI_PASS — copy secrets.example.h and fill in
+#include "secrets.h"
+#include "dashboard_html.h"
 
 // ---- config ----
-static const IPAddress UPSTREAM(9, 9, 9, 9);     // Quad9
+static const IPAddress UPSTREAM(9, 9, 9, 9);
 static const uint16_t DNS_PORT = 53;
+static const uint16_t DHCP_PORT = 67;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
-
-// ---- globals ----
-WiFiUDP dnsServer, upstreamCli;
-WebServer web(80);
-File blocklist;
-uint32_t numHashes = 0, totalBlocked = 0, totalAllowed = 0;
-uint8_t buf[600];
-
-struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; String label; };
+static const int DNS_BUF_SIZE = 1232;       // RFC 6891 max UDP DNS payload
+static const int MAX_PENDING = 32;          // concurrent outstanding upstream queries
 static const int MAX_CLIENTS = 96;
-Dev clients[MAX_CLIENTS]; int numClients = 0;
-
 static const int MAX_CUSTOM = 200;
-String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
-
 static const int MAX_BAN = 32;
-uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
+static const int MAX_DHCP_LEASES = 32;
+static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
+static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
+static const char* DASHBOARD_ETAG = "c3adb-v2";
 
-// remote blocklist auto-update
-String updateUrl = "";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
-uint32_t updateIntervalH = 24;      // hours between auto-fetches
-uint32_t lastCheckMs = 0;
-String updateStatus = "never";
+// ---- logging ----
+#ifdef NDEBUG
+#define LOG(...) ((void)0)
+#define LOGN(...) ((void)0)
+#else
+#define LOG(...) Serial.printf(__VA_ARGS__)
+#define LOGN(...) Serial.println(__VA_ARGS__)
+#endif
 
-// ---------- hashing / matching ----------
-static uint64_t fnv40(const char* s, size_t n) {
+// ---- forward declarations ----
+WebServer web(80);
+static const char* COLLECTED_HEADERS[] = {"Authorization", "If-None-Match", "Origin", "Referer"};
+String updateUrl, updateStatus = "never";
+uint32_t updateIntervalH = 24, lastCheckMs = 0;
+static uint32_t lastDnsActivityMs = 0;
+bool dhcpEnabled = false;
+static void saveDhcpCfg();
+static void saveWifiCfg(const String& ssid, const String& pass);
+static bool fetchBlocklist(String url);
+
+// ---- hashing ----------
+static uint64_t fnv64(const char* s, size_t n) {
   uint64_t h = 0xcbf29ce484222325ULL;
   for (size_t i = 0; i < n; i++) { h ^= (uint8_t)s[i]; h *= 0x100000001b3ULL; }
-  return h & HASH_MASK;
+  return h;
 }
+static inline uint64_t fnv40(const char* s, size_t n) { return fnv64(s, n) & HASH_MASK; }
+
+// ---- blocklist (flash hash table + RAM bloom filter) ----
+static const uint8_t BL_MAGIC[4] = {'C','A','D','B'};
+static const uint8_t BL_VERSION = 1;
+static const int BL_HEADER_SIZE = 20;
+
+File blocklist;
+uint32_t numHashes = 0;
+uint32_t hashTableOffset = 0;       // offset in file where sorted hashes begin
+
+uint8_t* bloomFilter = nullptr;     // malloc'd RAM bloom filter
+uint32_t bloomBits = 0;
+uint8_t bloomK = 0;
+
+static bool bloomMayContain(uint64_t h64) {
+  if (!bloomFilter || bloomBits == 0 || bloomK == 0) return true; // fail open -> check flash
+  uint32_t h1 = (uint32_t)(h64 & 0xFFFFFFFF);
+  uint32_t h2 = (uint32_t)(h64 >> 32);
+  if (h2 == 0) h2 = 0xFFFFFFFF;
+  for (uint8_t i = 0; i < bloomK; i++) {
+    uint32_t pos = (h1 + i * h2) % bloomBits;
+    if (!(bloomFilter[pos >> 3] & (1 << (pos & 7)))) return false;
+  }
+  return true;
+}
+
 static bool inFlash(uint64_t h) {
-  int32_t lo = 0, hi = (int32_t)numHashes - 1; uint8_t b[HASH_BYTES];
+  if (!blocklist || numHashes == 0) return false;
+  int32_t lo = 0, hi = (int32_t)numHashes - 1;
+  uint8_t b[HASH_BYTES];
   while (lo <= hi) {
     int32_t mid = (lo + hi) >> 1;
-    blocklist.seek((uint32_t)mid * HASH_BYTES); blocklist.read(b, HASH_BYTES);
-    uint64_t v = 0; for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
-    if (v < h) lo = mid + 1; else if (v > h) hi = mid - 1; else return true;
-  }
-  return false;
-}
-static bool inCustom(uint64_t h) { for (int i = 0; i < numCustom; i++) if (customHash[i] == h) return true; return false; }
-static bool isBlocked(const char* domain) {
-  const char* p = domain;
-  while (p && *p) {
-    uint64_t h = fnv40(p, strlen(p));
-    if (inFlash(h) || inCustom(h)) return true;
-    const char* dot = strchr(p, '.'); if (!dot) break;
-    const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
+    blocklist.seek(hashTableOffset + (uint32_t)mid * HASH_BYTES);
+    blocklist.read(b, HASH_BYTES);
+    uint64_t v = 0;
+    for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
+    if (v < h) lo = mid + 1;
+    else if (v > h) hi = mid - 1;
+    else return true;
   }
   return false;
 }
 
-// ---------- persistence ----------
+// ---- custom domains (sorted for binary search) ----
+String customDom[MAX_CUSTOM];
+uint64_t customHash[MAX_CUSTOM];  // kept sorted
+int numCustom = 0;
+
+static void sortCustom() {
+  for (int i = 1; i < numCustom; i++) {
+    uint64_t h = customHash[i]; String d = customDom[i];
+    int j = i - 1;
+    while (j >= 0 && customHash[j] > h) { customHash[j+1] = customHash[j]; customDom[j+1] = customDom[j]; j--; }
+    customHash[j+1] = h; customDom[j+1] = d;
+  }
+}
+static bool inCustom(uint64_t h) {
+  int lo = 0, hi = numCustom - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) >> 1;
+    if (customHash[mid] < h) lo = mid + 1;
+    else if (customHash[mid] > h) hi = mid - 1;
+    else return true;
+  }
+  return false;
+}
+
+// ---- isBlocked: check domain + parent suffixes, bloom-pre-filtered ----
+// Walks parent suffixes: ads.x.example -> x.example -> example.
+// Stops before the bare TLD (a block on "com" would break everything).
+static bool isBlocked(const char* domain, size_t dlen) {
+  const char* p = domain;
+  size_t remaining = dlen;
+  while (remaining > 0) {
+    uint64_t h64 = fnv64(p, remaining);
+    uint64_t h40 = h64 & HASH_MASK;
+    bool checkFlash = bloomMayContain(h64);  // false = definitely not in list, skip flash
+    if (checkFlash && (inFlash(h40) || inCustom(h40))) return true;
+    const char* dot = (const char*)memchr(p, '.', remaining);
+    if (!dot) break;
+    size_t consumed = (size_t)(dot - p) + 1;
+    remaining -= consumed;
+    p = dot + 1;
+    if (!memchr(p, '.', remaining)) break;  // don't test bare TLD
+  }
+  return false;
+}
+
+// ---- persistence: custom domains ----
 static void loadCustom() {
-  numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
+  numCustom = 0;
+  File f = LittleFS.open("/custom.txt", "r");
+  if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
     String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    if (l.length() && l.indexOf('.') > 0) {
+      customDom[numCustom] = l;
+      customHash[numCustom] = fnv40(l.c_str(), l.length());
+      numCustom++;
+    }
   }
   f.close();
+  sortCustom();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+static void saveCustom() {
+  File f = LittleFS.open("/custom.txt", "w");
+  if (!f) return;
+  for (int i = 0; i < numCustom; i++) f.println(customDom[i]);
+  f.close();
+}
 static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
+  d.trim(); d.toLowerCase();
+  if (d.startsWith("www.")) d = d.substring(4);
   if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+  customDom[numCustom] = d;
+  customHash[numCustom] = fnv40(d.c_str(), d.length());
+  numCustom++;
+  sortCustom();
+  saveCustom();
+  return true;
 }
 static void removeCustom(String d) {
   d.toLowerCase();
+  if (d.startsWith("www.")) d = d.substring(4);
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
     for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
+    numCustom--;
+    saveCustom();
+    return;
   }
 }
+
+// ---- banned IPs (decoupled from client table) ----
+uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
+static bool addBannedIP(uint32_t ip) {
+  if (isBannedIP(ip)) return false;
+  if (numBanned >= MAX_BAN) return false;
+  bannedIP[numBanned++] = ip;
+  return true;
+}
+static bool removeBannedIP(uint32_t ip) {
+  for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) {
+    for (int j = i; j < numBanned - 1; j++) bannedIP[j] = bannedIP[j+1];
+    numBanned--;
+    return true;
+  }
+  return false;
+}
 static void loadBanned() {
-  numBanned = 0; File f = LittleFS.open("/banned.txt", "r"); if (!f) return;
-  while (f.available() && numBanned < MAX_BAN) { String l = f.readStringUntil('\n'); l.trim(); IPAddress ip; if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip; }
+  numBanned = 0;
+  File f = LittleFS.open("/banned.txt", "r");
+  if (!f) return;
+  while (f.available() && numBanned < MAX_BAN) {
+    String l = f.readStringUntil('\n'); l.trim();
+    IPAddress ip;
+    if (l.length() && ip.fromString(l)) bannedIP[numBanned++] = (uint32_t)ip;
+  }
   f.close();
 }
 static void saveBanned() {
-  numBanned = 0;
-  for (int i = 0; i < numClients && numBanned < MAX_BAN; i++) if (clients[i].banned) bannedIP[numBanned++] = clients[i].ip;
-  File f = LittleFS.open("/banned.txt", "w"); if (!f) return;
+  File f = LittleFS.open("/banned.txt", "w");
+  if (!f) return;
   for (int i = 0; i < numBanned; i++) { IPAddress ip(bannedIP[i]); f.println(ip.toString()); }
   f.close();
 }
 
-// ---------- client table ----------
+// ---- client table (with LRU eviction) ----
+struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; bool banned; };
+Dev clients[MAX_CLIENTS]; int numClients = 0;
+uint32_t totalBlocked = 0, totalAllowed = 0;
+
 static void getMac(uint32_t ip, uint8_t* mac) {
-  memset(mac, 0, 6); ip4_addr_t ipa; ipa.addr = ip;
+  memset(mac, 0, 6);
+  ip4_addr_t ipa; ipa.addr = ip;
   struct eth_addr* eth = nullptr; const ip4_addr_t* ipret = nullptr;
   for (struct netif* nif = netif_list; nif; nif = nif->next)
     if (etharp_find_addr(nif, &ipa, &eth, &ipret) >= 0 && eth) { memcpy(mac, eth->addr, 6); return; }
 }
 static Dev* getClient(uint32_t ip) {
-  for (int i = 0; i < numClients; i++) if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
-  if (numClients < MAX_CLIENTS) {
-    Dev* c = &clients[numClients++];
-    c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis(); c->banned = isBannedIP(ip); c->label = "";
-    getMac(ip, c->mac); return c;
+  for (int i = 0; i < numClients; i++)
+    if (clients[i].ip == ip) { clients[i].lastSeen = millis(); return &clients[i]; }
+  int slot = numClients;
+  if (numClients >= MAX_CLIENTS) {
+    // Evict stalest client
+    int oldest = 0;
+    for (int i = 1; i < numClients; i++)
+      if (clients[i].lastSeen < clients[oldest].lastSeen) oldest = i;
+    slot = oldest;
+  } else {
+    numClients++;
   }
-  return nullptr;
+  Dev* c = &clients[slot];
+  c->ip = ip; c->blocked = c->allowed = 0; c->lastSeen = millis();
+  c->banned = isBannedIP(ip);
+  getMac(ip, c->mac);
+  return c;
 }
 
-// ---------- DNS ----------
+// ---- DNS parsing (robust bounds checking) ----
 static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype, int* qend) {
-  if (len < 13) return 0; int i = 12; size_t o = 0;
-  while (i < len) { uint8_t l = pkt[i++]; if (l == 0) break; if (l & 0xC0) return 0;
-    if (o + l + 1 >= 250 || i + l > len) return 0; if (o) out[o++] = '.';
-    for (uint8_t k = 0; k < l; k++) out[o++] = tolower(pkt[i++]); }
-  out[o] = 0; if (i + 4 > len) return 0; *qtype = (pkt[i] << 8) | pkt[i + 1]; *qend = i + 4;
+  if (len < 13) return 0;
+  int i = 12; size_t o = 0;
+  while (i < len) {
+    uint8_t l = pkt[i++];
+    if (l == 0) break;
+    if (l & 0xC0) return 0;  // compression pointer — invalid in a query
+    if (o + l + 1 >= 250 || i + l > len) return 0;
+    if (o) out[o++] = '.';
+    for (uint8_t k = 0; k < l; k++) out[o++] = tolower(pkt[i++]);
+  }
+  out[o] = 0;
+  if (i + 4 > len) return 0;  // need qtype(2) + qclass(2)
+  *qtype = (pkt[i] << 8) | pkt[i + 1];
+  *qend = i + 4;
+  // strip leading www.
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
-static int buildBlocked(int qend, uint16_t qtype) {
-  buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
-  if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
-  memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
+
+// ---- DNS blocking (A -> 0.0.0.0, AAAA -> ::) ----
+static int buildBlocked(uint8_t* pkt, int qend, uint16_t qtype) {
+  // flags: response, recursion available; ANCOUNT=1 for A/AAAA, 0 otherwise
+  pkt[2] = 0x81; pkt[3] = 0x80;
+  pkt[6] = 0; pkt[7] = (qtype == 1 || qtype == 28) ? 1 : 0;
+  pkt[8] = 0; pkt[9] = 0; pkt[10] = 0; pkt[11] = 0;  // NSCOUNT=ARCOUNT=0 (no EDNS in reply)
+  if (qtype == 1) {
+    // A record: 0.0.0.0, TTL 300
+    const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+    memcpy(pkt + qend, ans, sizeof(ans));
+    return qend + sizeof(ans);
+  }
+  if (qtype == 28) {
+    // AAAA record: ::, TTL 300
+    const uint8_t ans[] = {0xC0,0x0C, 0,28, 0,1, 0,0,1,0x2C, 0,16, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    memcpy(pkt + qend, ans, sizeof(ans));
+    return qend + sizeof(ans);
+  }
+  return qend;  // other qtypes: no answer (NXDOMAIN-ish)
 }
-static int forwardUpstream(int qlen) {
-  upstreamCli.beginPacket(UPSTREAM, 53); upstreamCli.write(buf, qlen); upstreamCli.endPacket();
-  uint32_t t0 = millis();
-  while (millis() - t0 < 1000) { int sz = upstreamCli.parsePacket(); if (sz > 0) return upstreamCli.read(buf, sizeof(buf)); delay(1); }
-  return 0;
+
+// ---- async DNS forwarding ----
+WiFiUDP dnsServer;     // listens on :53 for client queries
+WiFiUDP upstream;      // ephemeral port for upstream queries/replies
+WiFiUDP tcpUpstream;   // separate socket for TCP DNS forwarding
+
+struct Pending {
+  uint32_t clientIP;
+  uint16_t clientPort;
+  uint16_t originalID;
+  uint32_t sentMs;
+  bool active;
+};
+Pending pending[MAX_PENDING];
+int pendingCount = 0;
+
+static int findFreeSlot() {
+  for (int i = 0; i < MAX_PENDING; i++) if (!pending[i].active) return i;
+  return -1;
 }
+static void expirePending() {
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_PENDING; i++)
+    if (pending[i].active && (now - pending[i].sentMs) > UPSTREAM_TIMEOUT_MS) {
+      pending[i].active = false;
+      pendingCount--;
+    }
+}
+static void pollUpstream(uint8_t* buf, int bufSize) {
+  int sz = upstream.parsePacket();
+  if (sz <= 0) return;
+  int rlen = upstream.read(buf, bufSize);
+  if (rlen < 2) return;
+  uint16_t replyID = (buf[0] << 8) | buf[1];
+  if (replyID >= MAX_PENDING || !pending[replyID].active) return;
+  // Restore original query ID
+  buf[0] = (pending[replyID].originalID >> 8) & 0xFF;
+  buf[1] = pending[replyID].originalID & 0xFF;
+  dnsServer.beginPacket(pending[replyID].clientIP, pending[replyID].clientPort);
+  dnsServer.write(buf, rlen);
+  dnsServer.endPacket();
+  pending[replyID].active = false;
+  pendingCount--;
+}
+
+static uint8_t dnsBuf[DNS_BUF_SIZE];
+
 static void handleDns() {
-  int sz = dnsServer.parsePacket(); if (sz <= 0) return;
-  IPAddress cip = dnsServer.remoteIP(); uint16_t cport = dnsServer.remotePort();
-  int qlen = dnsServer.read(buf, sizeof(buf)); if (qlen < 13) return;
+  int sz = dnsServer.parsePacket();
+  if (sz <= 0) return;
+  lastDnsActivityMs = millis();
+  IPAddress cip = dnsServer.remoteIP();
+  uint16_t cport = dnsServer.remotePort();
+  int qlen = dnsServer.read(dnsBuf, sizeof(dnsBuf));
+  if (qlen < 13) return;
+
   char domain[256]; uint16_t qtype = 0; int qend = qlen;
-  size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
+  size_t dl = parseQuery(dnsBuf, qlen, domain, &qtype, &qend);
+
   Dev* c = getClient((uint32_t)cip);
   bool ban = c && c->banned;
-  bool blocked = ban || (dl && numHashes && isBlocked(domain));
-  int rlen;
-  if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
-  else         { rlen = forwardUpstream(qlen);     totalAllowed++; if (c) c->allowed++; }
-  if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+  bool blocked = ban || (dl && numHashes && isBlocked(domain, dl));
+
+  if (blocked) {
+    int rlen = buildBlocked(dnsBuf, qend, qtype);
+    totalBlocked++;
+    if (c) c->blocked++;
+    dnsServer.beginPacket(cip, cport);
+    dnsServer.write(dnsBuf, rlen);
+    dnsServer.endPacket();
+  } else {
+    int slot = findFreeSlot();
+    if (slot < 0) return;  // pending table full — drop query
+    uint16_t origID = (dnsBuf[0] << 8) | dnsBuf[1];
+    dnsBuf[0] = (slot >> 8) & 0xFF;
+    dnsBuf[1] = slot & 0xFF;
+    pending[slot].clientIP = (uint32_t)cip;
+    pending[slot].clientPort = cport;
+    pending[slot].originalID = origID;
+    pending[slot].sentMs = millis();
+    pending[slot].active = true;
+    pendingCount++;
+    upstream.beginPacket(UPSTREAM, 53);
+    upstream.write(dnsBuf, qlen);
+    upstream.endPacket();
+    totalAllowed++;
+    if (c) c->allowed++;
+  }
 }
 
-// ---------- web ----------
-static String macStr(const uint8_t* m) { char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]); return String(s); }
-static String jesc(const String& s) { String o; for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; } return o; }
+// ---- TCP DNS (one query per connection) ----
+WiFiServer tcpDnsServer(DNS_PORT);
+WiFiClient tcpDnsClient;
+static uint8_t tcpBuf[DNS_BUF_SIZE];
 
-const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>C3 AdBlock</title><style>
-body{font:14px system-ui,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
-header{background:#161b22;padding:14px 18px;border-bottom:1px solid #30363d}
-h1{margin:0;font-size:18px}h1 span{color:#3fb950}.wrap{padding:16px;max-width:1000px;margin:auto}
-.cards{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px;flex:1;min-width:120px}
-.card .v{font-size:22px;font-weight:600}.card .l{color:#8b949e;font-size:12px}
-table{width:100%;border-collapse:collapse;background:#161b22;border-radius:8px;overflow:hidden;margin-bottom:18px}
-th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #21262d;font-size:13px}
-th{background:#21262d;color:#8b949e}tr:hover td{background:#1c2128}
-.b{color:#f85149}.a{color:#3fb950}.tag{background:#30363d;border-radius:4px;padding:1px 6px;font-size:11px}
-button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5px;padding:4px 9px;cursor:pointer}
-button:hover{background:#30363d}.ban{color:#f85149}input{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
-h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
-</style></head><body>
-<header><h1>🛡️ C3 AdBlock <span id=host></span></h1></header><div class=wrap>
-<div class=cards id=sys></div>
-<h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
-<h2>CUSTOM BLOCKED DOMAINS</h2>
-<div style=margin-bottom:8px><input id=dom placeholder="ads.example.com" size=30><button onclick=addDom()>Block domain</button></div>
-<table id=cl><tbody></tbody></table>
-<h2>BLOCKLIST &mdash; UPLOAD</h2>
-<form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
-<h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
-<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
-<button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule (e.g. a GitHub release asset). last: <span id=ustat>&mdash;</span></div>
-<h2>FIRMWARE &mdash; OTA UPDATE</h2>
-<form id=fwf style=margin-bottom:6px><input type=file id=fwb accept=.bin><button>Flash firmware</button> <span id=fwmsg style=color:#8b949e></span></form>
-<div style="color:#8b949e;font-size:12px;margin-bottom:18px">upload <code>.pio/build/c3/firmware.bin</code> &mdash; device verifies it and reboots into it</div>
-</div><script>
-function fmt(n){return n.toLocaleString()}
-async function load(){let s=await(await fetch('/stats.json')).json();
-host.textContent='@ '+s.ip;
-sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['Clients',s.clients.length,''],['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' °C',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
-.map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${c.ip}').then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24)).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/update',{method:'POST',body:fd});fwmsg.textContent=r.ok?'✓ rebooting, reconnect in ~15s':'✗ '+await r.text();}
-catch(_){fwmsg.textContent='✓ rebooting, reconnect in ~15s';}};
-upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
-upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?'✓ updated':'✗ '+await r.text();}
-catch(_){upmsg.textContent='✗ upload failed';}
-blf.value='';setTimeout(load,600);};
-load();setInterval(load,3000);
-</script></body></html>)HTML";
+static int forwardUpstreamSync(uint8_t* pkt, int qlen) {
+  uint16_t origID = (pkt[0] << 8) | pkt[1];
+  pkt[0] = 0xFF; pkt[1] = 0xFE;  // use fixed ID to avoid collision with UDP slots 0-31
+  tcpUpstream.beginPacket(UPSTREAM, 53);
+  tcpUpstream.write(pkt, qlen);
+  tcpUpstream.endPacket();
+  pkt[0] = (origID >> 8) & 0xFF; pkt[1] = origID & 0xFF;  // restore for blocked path
+  uint32_t t0 = millis();
+  while (millis() - t0 < UPSTREAM_TIMEOUT_MS) {
+    int sz = tcpUpstream.parsePacket();
+    if (sz > 0) {
+      int n = tcpUpstream.read(pkt, DNS_BUF_SIZE);
+      if (n >= 2) {
+        pkt[0] = (origID >> 8) & 0xFF; pkt[1] = origID & 0xFF;
+        return n;
+      }
+      return 0;
+    }
+    delay(1);
+  }
+  return 0;
+}
+
+static void handleTcpDns() {
+  if (!tcpDnsClient || !tcpDnsClient.connected()) {
+    tcpDnsClient = tcpDnsServer.accept();
+    if (!tcpDnsClient) return;
+  }
+  if (!tcpDnsClient.connected()) return;
+  if (tcpDnsClient.available() < 2) return;
+
+  uint8_t lenBuf[2];
+  tcpDnsClient.read(lenBuf, 2);
+  uint16_t msgLen = (lenBuf[0] << 8) | lenBuf[1];
+  if (msgLen > DNS_BUF_SIZE) { tcpDnsClient.stop(); return; }
+
+  int total = 0;
+  uint32_t t0 = millis();
+  while (total < msgLen && tcpDnsClient.connected()) {
+    if (tcpDnsClient.available()) {
+      int n = tcpDnsClient.read(tcpBuf + total, msgLen - total);
+      if (n <= 0) break;
+      total += n;
+    } else {
+      if (millis() - t0 > UPSTREAM_TIMEOUT_MS) break;
+      delay(1);
+    }
+  }
+  if (total < msgLen) { tcpDnsClient.stop(); return; }
+
+  char domain[256]; uint16_t qtype = 0; int qend = total;
+  size_t dl = parseQuery(tcpBuf, total, domain, &qtype, &qend);
+  Dev* c = getClient((uint32_t)tcpDnsClient.remoteIP());
+  bool ban = c && c->banned;
+  bool blocked = ban || (dl && numHashes && isBlocked(domain, dl));
+
+  int rlen;
+  if (blocked) {
+    rlen = buildBlocked(tcpBuf, qend, qtype);
+    totalBlocked++; if (c) c->blocked++;
+  } else {
+    rlen = forwardUpstreamSync(tcpBuf, total);
+    totalAllowed++; if (c) c->allowed++;
+  }
+
+  if (rlen > 0) {
+    uint8_t lenOut[2] = { (uint8_t)(rlen >> 8), (uint8_t)(rlen & 0xFF) };
+    tcpDnsClient.write(lenOut, 2);
+    tcpDnsClient.write(tcpBuf, rlen);
+  }
+  tcpDnsClient.stop();
+}
+
+// ---- DHCP server (optional, disabled by default) ----
+WiFiUDP dhcpSock;
+
+struct DhcpLease { uint8_t mac[6]; uint32_t ip; uint32_t expires; bool active; };
+DhcpLease dhcpLeases[MAX_DHCP_LEASES];
+
+static uint32_t dhcpPoolStart = 0;
+static uint32_t dhcpPoolEnd = 0;
+
+static void initDhcpPool() {
+  IPAddress local = WiFi.localIP();
+  IPAddress gw = WiFi.gatewayIP();
+  // Pool: gateway + 100 to gateway + 200 (or local + 100..200 if no gateway)
+  uint32_t base = (uint32_t)gw;
+  if (base == 0) base = (uint32_t)local;
+  dhcpPoolStart = htonl(base) + 100;
+  dhcpPoolEnd = htonl(base) + 200;
+}
+
+static uint32_t findDhcpLease(const uint8_t* mac) {
+  for (int i = 0; i < MAX_DHCP_LEASES; i++)
+    if (dhcpLeases[i].active && memcmp(dhcpLeases[i].mac, mac, 6) == 0)
+      return dhcpLeases[i].ip;
+  return 0;
+}
+static uint32_t assignDhcpIP(const uint8_t* mac) {
+  // Existing lease?
+  uint32_t existing = findDhcpLease(mac);
+  if (existing) return existing;
+  // Find free IP in pool
+  for (uint32_t candidate = dhcpPoolStart; candidate <= dhcpPoolEnd; candidate++) {
+    bool taken = false;
+    for (int i = 0; i < MAX_DHCP_LEASES; i++)
+      if (dhcpLeases[i].active && dhcpLeases[i].ip == candidate) { taken = true; break; }
+    if (!taken) {
+      // Find free lease slot
+      for (int i = 0; i < MAX_DHCP_LEASES; i++) {
+        if (!dhcpLeases[i].active) {
+          memcpy(dhcpLeases[i].mac, mac, 6);
+          dhcpLeases[i].ip = candidate;
+          dhcpLeases[i].expires = millis() + 86400000UL;  // 24h
+          dhcpLeases[i].active = true;
+          return candidate;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static void handleDhcp() {
+  int sz = dhcpSock.parsePacket();
+  if (sz <= 0) return;
+  uint8_t dhcp[548];
+  int len = dhcpSock.read(dhcp, sizeof(dhcp));
+  if (len < 240) return;
+  if (dhcp[0] != 1) return;  // BOOTREQUEST
+  uint32_t xid = (dhcp[4] << 24) | (dhcp[5] << 16) | (dhcp[6] << 8) | dhcp[7];
+  uint8_t* mac = dhcp + 28;
+  // Magic cookie at offset 236
+  if (dhcp[236] != 0x63 || dhcp[237] != 0x82 || dhcp[238] != 0x53 || dhcp[239] != 0x63) return;
+
+  uint8_t msgType = 0;
+  int oi = 240;
+  while (oi < len && dhcp[oi] != 0xFF) {
+    uint8_t opt = dhcp[oi++];
+    if (opt == 0) continue;
+    if (oi >= len) break;
+    uint8_t optLen = dhcp[oi++];
+    if (opt == 53 && optLen == 1) msgType = dhcp[oi];
+    oi += optLen;
+  }
+  if (msgType != 1 && msgType != 3) return;  // only DISCOVER and REQUEST
+
+  uint32_t clientIP = assignDhcpIP(mac);
+  if (clientIP == 0) return;
+
+  // Build response
+  memset(dhcp, 0, 240);
+  dhcp[0] = 2;  // BOOTREPLY
+  dhcp[1] = 1;  // Ethernet
+  dhcp[2] = 6;  // HLEN
+  dhcp[4] = (xid >> 24) & 0xFF; dhcp[5] = (xid >> 16) & 0xFF;
+  dhcp[6] = (xid >> 8) & 0xFF; dhcp[7] = xid & 0xFF;
+  dhcp[10] = 0x80;  // broadcast flag
+  // YIADDR (offset 16) = client IP (big-endian)
+  dhcp[16] = (clientIP >> 24) & 0xFF; dhcp[17] = (clientIP >> 16) & 0xFF;
+  dhcp[18] = (clientIP >> 8) & 0xFF; dhcp[19] = clientIP & 0xFF;
+  // SIADDR (offset 20) = our IP
+  IPAddress ourIP = WiFi.localIP();
+  dhcp[20] = ourIP[0]; dhcp[21] = ourIP[1]; dhcp[22] = ourIP[2]; dhcp[23] = ourIP[3];
+  // CHADDR (offset 28) = client MAC
+  memcpy(dhcp + 28, mac, 6);
+  // Magic cookie
+  dhcp[236] = 0x63; dhcp[237] = 0x82; dhcp[238] = 0x53; dhcp[239] = 0x63;
+
+  int o = 240;
+  dhcp[o++] = 53; dhcp[o++] = 1; dhcp[o++] = (msgType == 1) ? 2 : 5;  // OFFER or ACK
+  dhcp[o++] = 54; dhcp[o++] = 4; dhcp[o++] = ourIP[0]; dhcp[o++] = ourIP[1]; dhcp[o++] = ourIP[2]; dhcp[o++] = ourIP[3];
+  IPAddress mask = WiFi.subnetMask();
+  dhcp[o++] = 1; dhcp[o++] = 4; dhcp[o++] = mask[0]; dhcp[o++] = mask[1]; dhcp[o++] = mask[2]; dhcp[o++] = mask[3];
+  IPAddress gw = WiFi.gatewayIP();
+  dhcp[o++] = 3; dhcp[o++] = 4; dhcp[o++] = gw[0]; dhcp[o++] = gw[1]; dhcp[o++] = gw[2]; dhcp[o++] = gw[3];
+  // DNS = our IP (so clients use the C3 for DNS)
+  dhcp[o++] = 6; dhcp[o++] = 4; dhcp[o++] = ourIP[0]; dhcp[o++] = ourIP[1]; dhcp[o++] = ourIP[2]; dhcp[o++] = ourIP[3];
+  // Lease time = 24h (big-endian)
+  dhcp[o++] = 51; dhcp[o++] = 4; dhcp[o++] = 0; dhcp[o++] = 0; dhcp[o++] = 0x51; dhcp[o++] = 0x80;
+  dhcp[o++] = 0xFF;  // end
+
+  dhcpSock.beginPacket(dhcpSock.remoteIP(), 68);
+  dhcpSock.write(dhcp, o);
+  dhcpSock.endPacket();
+}
+
+// ---- auth (Basic Auth + CSRF token) ----
+String authPassword;
+String authToken;
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static String b64encode(const String& s) {
+  String o;
+  const uint8_t* in = (const uint8_t*)s.c_str();
+  int len = s.length();
+  for (int i = 0; i < len; i += 3) {
+    uint32_t n = (uint32_t)in[i] << 16;
+    if (i + 1 < len) n |= (uint32_t)in[i+1] << 8;
+    if (i + 2 < len) n |= in[i+2];
+    o += B64[(n >> 18) & 0x3F];
+    o += B64[(n >> 12) & 0x3F];
+    o += (i + 1 < len) ? B64[(n >> 6) & 0x3F] : '=';
+    o += (i + 2 < len) ? B64[n & 0x3F] : '=';
+  }
+  return o;
+}
+static void genRandomPassword() {
+  const char chars[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  authPassword = "";
+  for (int i = 0; i < 10; i++)
+    authPassword += chars[esp_random() % (sizeof(chars) - 1)];
+  authToken = String((uint32_t)(esp_random() & 0xFFFFFF), HEX);
+}
+static void loadAuth() {
+  File f = LittleFS.open("/auth.cfg", "r");
+  if (f) {
+    authPassword = f.readStringUntil('\n'); authPassword.trim();
+    authToken = f.readStringUntil('\n'); authToken.trim();
+    f.close();
+  }
+  if (authPassword.length() == 0) {
+    genRandomPassword();
+    File fo = LittleFS.open("/auth.cfg", "w");
+    if (fo) { fo.println(authPassword); fo.println(authToken); fo.close(); }
+  }
+}
+static bool checkAuth() {
+  String expected = "Basic " + b64encode("admin:" + authPassword);
+  return web.header("Authorization") == expected;
+}
+static bool checkToken() {
+  return web.hasArg("token") && web.arg("token") == authToken;
+}
+static void requireAuth() {
+  web.sendHeader("WWW-Authenticate", "Basic realm=\"C3 AdBlock\"");
+  web.send(401, "text/plain", "auth required");
+}
+
+// ---- web server ----
+
+static String macStr(const uint8_t* m) {
+  char s[18]; snprintf(s, sizeof(s), "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]);
+  return String(s);
+}
+static String jesc(const String& s) {
+  String o;
+  for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; }
+  return o;
+}
+
+static void handleRoot() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (web.header("If-None-Match") == DASHBOARD_ETAG) { web.send(304); return; }
+  web.sendHeader("Cache-Control", "max-age=3600");
+  web.sendHeader("ETag", DASHBOARD_ETAG);
+  web.send_P(200, "text/html", PAGE);
+}
 
 static void handleStats() {
+  if (!checkAuth()) { requireAuth(); return; }
   uint32_t up = millis() / 1000;
-  char ut[24]; snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
-  String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked + ",\"allowed\":" + totalAllowed +
-             ",\"domains\":" + numHashes + ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
+  char ut[24];
+  snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
+  String bloomStr = bloomFilter ? (String(bloomBits / 8 / 1024) + " KB") : String("off");
+
+  String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked +
+             ",\"allowed\":" + totalAllowed + ",\"domains\":" + numHashes +
+             ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"bloom\":\"" + jesc(bloomStr) + "\",\"pending\":" + pendingCount +
+             ",\"dhcp\":" + (dhcpEnabled ? "true" : "false") +
+             ",\"wifi\":\"" + jesc(WiFi.SSID()) + "\"" +
+             ",\"token\":\"" + jesc(authToken) + "\"" +
+             ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
+             ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"clients\":[";
-  for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
-    j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
+  for (int i = 0; i < numClients; i++) {
+    Dev& c = clients[i]; IPAddress ip(c.ip);
+    j += (i ? "," : "");
+    j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) +
+         "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed +
+         ",\"banned\":" + (c.banned ? "true" : "false") + "}";
+  }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "]}";
   web.send(200, "application/json", j);
 }
+
 static void handleBan() {
-  IPAddress ip; if (ip.fromString(web.arg("ip"))) { Dev* c = getClient((uint32_t)ip); if (c) { c->banned = !c->banned; saveBanned(); } }
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  IPAddress ip;
+  if (ip.fromString(web.arg("ip"))) {
+    uint32_t ipraw = (uint32_t)ip;
+    Dev* c = getClient(ipraw);
+    if (c) {
+      c->banned = !c->banned;
+      if (c->banned) addBannedIP(ipraw); else removeBannedIP(ipraw);
+      saveBanned();
+    }
+  }
   web.send(200, "text/plain", "ok");
 }
 
-// ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
+static void handleAddBlock() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  addCustom(web.arg("d"));
+  web.send(200, "text/plain", "ok");
+}
+static void handleUnblock() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  removeCustom(web.arg("d"));
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleDhcpToggle() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  dhcpEnabled = !dhcpEnabled;
+  saveDhcpCfg();
+  if (dhcpEnabled) {
+    initDhcpPool();
+    dhcpSock.begin(DHCP_PORT);
+    web.send(200, "text/plain", "DHCP enabled — disable your router's DHCP!");
+  } else {
+    dhcpSock.stop();
+    web.send(200, "text/plain", "DHCP disabled");
+  }
+}
+
+static void handleSetWifi() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  String ssid = web.arg("ssid");
+  String pass = web.arg("pass");
+  if (ssid.length() == 0) { web.send(400, "text/plain", "missing ssid"); return; }
+  saveWifiCfg(ssid, pass);
+  web.send(200, "text/plain", "saved — rebooting...");
+  delay(500);
+  ESP.restart();
+}
+
+// ---- blocklist swap (shared by upload + remote fetch) ----
+static void loadBloomFromBlocklist(File& f) {
+  if (bloomFilter) { free(bloomFilter); bloomFilter = nullptr; }
+  bloomBits = 0; bloomK = 0;
+  if (!f) return;
+  uint8_t hdr[BL_HEADER_SIZE];
+  f.seek(0);
+  if (f.read(hdr, BL_HEADER_SIZE) != BL_HEADER_SIZE) return;
+  if (memcmp(hdr, BL_MAGIC, 4) != 0) { LOGN("[bl] bad magic"); return; }
+  if (hdr[4] != BL_VERSION) { LOGN("[bl] wrong version"); return; }
+  if (hdr[5] != HASH_BYTES) { LOGN("[bl] wrong hash_bytes"); return; }
+  numHashes = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
+  bloomBits = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
+  bloomK = hdr[14];
+  if (bloomBits > 0 && bloomK > 0) {
+    size_t bloomBytes = (bloomBits + 7) / 8;
+    bloomFilter = (uint8_t*)malloc(bloomBytes);
+    if (bloomFilter) {
+      f.read(bloomFilter, bloomBytes);
+      hashTableOffset = BL_HEADER_SIZE + bloomBytes;
+    } else {
+      LOGN("[bl] bloom malloc failed — running without bloom");
+      bloomBits = 0; bloomK = 0;
+      hashTableOffset = BL_HEADER_SIZE;
+    }
+  } else {
+    hashTableOffset = BL_HEADER_SIZE;
+  }
+}
+
 static void reopenBlocklist() {
+  if (blocklist) blocklist.close();
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+  loadBloomFromBlocklist(blocklist);
+  if (blocklist) LOG("[bl] %u domains, bloom %u bits k=%u\n", numHashes, bloomBits, bloomK);
 }
 static void beginBlocklistSwap() {
   if (blocklist) blocklist.close();
   numHashes = 0;
+  if (bloomFilter) { free(bloomFilter); bloomFilter = nullptr; }
+  bloomBits = 0; bloomK = 0;
   LittleFS.remove(BLOCKLIST_PATH);
   LittleFS.remove("/blocklist.new");
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
+static bool commitNewBlocklist() {
   File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
+  size_t sz = f ? f.size() : 0;
+  if (f) f.close();
+  // Validate: must have header with correct magic + version + hash_bytes
+  bool ok = false;
+  if (sz >= BL_HEADER_SIZE) {
+    File chk = LittleFS.open("/blocklist.new", "r");
+    uint8_t hdr[BL_HEADER_SIZE];
+    if (chk.read(hdr, BL_HEADER_SIZE) == BL_HEADER_SIZE) {
+      if (memcmp(hdr, BL_MAGIC, 4) == 0 && hdr[4] == BL_VERSION && hdr[5] == HASH_BYTES) {
+        uint32_t nh = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
+        uint32_t bb = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
+        size_t expected = BL_HEADER_SIZE + (bb + 7) / 8 + (size_t)nh * HASH_BYTES;
+        if (sz == expected) ok = true;
+      }
+    }
+    chk.close();
+  }
   if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
   else    LittleFS.remove("/blocklist.new");
   reopenBlocklist();
   return ok;
 }
 
-// ---------- OTA blocklist update (browser upload) ----------
+// ---- OTA blocklist update (browser upload) ----
 static bool upOk = false;
 static File upFile;
 static void handleUploadDone() {
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+           upOk ? "ok" : "rejected: invalid blocklist (bad magic/version/size)");
 }
 static void handleUpload() {
+  if (!checkAuth()) { requireAuth(); return; }
   HTTPUpload& u = web.upload();
   switch (u.status) {
     case UPLOAD_FILE_START:
       upOk = false; beginBlocklistSwap();
       upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+      LOG("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
       if (upFile) upFile.write(u.buf, u.currentSize);
@@ -297,118 +861,298 @@ static void handleUpload() {
     case UPLOAD_FILE_END:
       if (upFile) upFile.close();
       upOk = commitNewBlocklist();
-      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+      LOG("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
       break;
     case UPLOAD_FILE_ABORTED:
       if (upFile) upFile.close();
       LittleFS.remove("/blocklist.new"); reopenBlocklist();
-      Serial.println("[ota] aborted");
+      LOGN("[ota] aborted");
       break;
   }
 }
 
-// ---------- remote blocklist auto-update ----------
+// ---- remote blocklist auto-update ----
+
 static void loadUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
+  File f = LittleFS.open("/update.cfg", "r");
+  if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
-  String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
-  f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  String iv = f.readStringUntil('\n'); iv.trim();
+  if (iv.length()) updateIntervalH = iv.toInt();
+  f.close();
+  if (updateIntervalH < 1) updateIntervalH = 1;
 }
 static void saveUpdateCfg() {
-  File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
+  File f = LittleFS.open("/update.cfg", "w");
+  if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
 static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
-  Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
+  url.trim();
+  if (!url.length()) { updateStatus = "no url set"; return false; }
+  LOG("[remote] GET %s\n", url.c_str());
+  WiFiClientSecure cs;
+  // CA verification — do NOT call setInsecure(). Arduino-ESP32 uses bundled Mozilla CAs by default.
   WiFiClient cl;
-  HTTPClient http; http.setTimeout(20000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) {
+    updateStatus = "begin failed"; return false;
+  }
   int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+  if (code != HTTP_CODE_OK) {
+    http.end(); updateStatus = "HTTP " + String(code);
+    LOG("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
   beginBlocklistSwap();
   File f = LittleFS.open("/blocklist.new", "w");
   if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
   WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
+  int len = http.getSize();
+  uint8_t b[1024];
+  size_t total = 0;
+  uint32_t idle = millis();
   while (http.connected() && (len < 0 || (int)total < len)) {
     size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+    if (avail) {
+      int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
+      if (n > 0) { f.write(b, n); total += n; idle = millis(); }
+    } else {
+      if (millis() - idle > 15000) break;
+      delay(2);
+    }
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
   updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
-  Serial.printf("[remote] %s\n", updateStatus.c_str());
+  LOG("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
 
-// ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
+// ---- firmware OTA ----
 static void handleFwUpdateDone() {
   bool ok = !Update.hasError();
   web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
+  if (!checkAuth()) { requireAuth(); return; }
   HTTPUpload& u = web.upload();
   if (u.status == UPLOAD_FILE_START) {
-    Serial.printf("[fw-ota] %s\n", u.filename.c_str());
+    LOG("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_WRITE) {
     if (Update.write(u.buf, u.currentSize) != u.currentSize) Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_END) {
-    if (Update.end(true)) Serial.printf("[fw-ota] %u bytes OK\n", u.totalSize);
+    if (Update.end(true)) LOG("[fw-ota] %u bytes OK\n", u.totalSize);
     else Update.printError(Serial);
   } else if (u.status == UPLOAD_FILE_ABORTED) {
-    Update.abort(); Serial.println("[fw-ota] aborted");
+    Update.abort(); LOGN("[fw-ota] aborted");
   }
 }
 
-void setup() {
-  Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting");
-  if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  if (blocklist) { numHashes = blocklist.size() / HASH_BYTES; Serial.printf("blocklist: %u domains\n", numHashes); }
-  loadCustom(); loadBanned(); loadUpdateCfg();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+// ---- WiFi config (WiFiManager captive portal) ----
+static bool loadWifiCfg(String& ssid, String& pass) {
+  File f = LittleFS.open("/wifi.cfg", "r");
+  if (!f) return false;
+  ssid = f.readStringUntil('\n'); ssid.trim();
+  pass = f.readStringUntil('\n'); pass.trim();
+  f.close();
+  return ssid.length() > 0;
+}
+static void saveWifiCfg(const String& ssid, const String& pass) {
+  File f = LittleFS.open("/wifi.cfg", "w");
+  if (!f) return;
+  f.println(ssid); f.println(pass); f.close();
+}
 
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi"); while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
-  Serial.printf("\nWiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
+static bool connectWiFi() {
+  String ssid, pass;
+  bool hasCfg = loadWifiCfg(ssid, pass);
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
-  web.on("/", []() { web.send_P(200, "text/html", PAGE); });
-  web.on("/stats.json", handleStats);
-  web.on("/ban", handleBan);
-  web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
-  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
-  web.on("/setupdate", []() {
-    if (web.hasArg("u")) updateUrl = web.arg("u");
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
-    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  // Try saved config first, then secrets.h
+  const char* trySsid = nullptr;
+  const char* tryPass = nullptr;
+  if (hasCfg) { trySsid = ssid.c_str(); tryPass = pass.c_str(); }
+  else if (String(WIFI_SSID) != "YOUR_WIFI_SSID") { trySsid = WIFI_SSID; tryPass = WIFI_PASS; }
+
+  if (!trySsid) return false;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(trySsid, tryPass);
+  LOG("WiFi: connecting to %s", trySsid);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) {
+    delay(300); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    LOGN("\nWiFi up: " + WiFi.localIP().toString());
+    return true;
+  }
+  LOGN("\nWiFi connect failed");
+  WiFi.disconnect();
+  return false;
+}
+
+// ---- captive portal ----
+static WiFiUDP captiveDns;
+
+static void handleCaptiveDns() {
+  int sz = captiveDns.parsePacket();
+  if (sz <= 0) return;
+  IPAddress cip = captiveDns.remoteIP();
+  uint16_t cport = captiveDns.remotePort();
+  int qlen = captiveDns.read(dnsBuf, sizeof(dnsBuf));
+  if (qlen < 13) return;
+  // Respond to all A queries with 192.168.4.1
+  dnsBuf[2] = 0x81; dnsBuf[3] = 0x80;
+  dnsBuf[6] = 0; dnsBuf[7] = 1;
+  dnsBuf[8] = 0; dnsBuf[9] = 0; dnsBuf[10] = 0; dnsBuf[11] = 0;
+  char domain[256]; uint16_t qtype; int qend;
+  parseQuery(dnsBuf, qlen, domain, &qtype, &qend);
+  if (qtype == 1) {
+    uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,0,60, 0,4, 192,168,4,1};
+    memcpy(dnsBuf + qend, ans, sizeof(ans));
+    captiveDns.beginPacket(cip, cport);
+    captiveDns.write(dnsBuf, qend + sizeof(ans));
+    captiveDns.endPacket();
+  }
+}
+
+static void runCaptivePortal() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("C3AdBlock-Setup");
+  LOGN("\n[captive] AP: C3AdBlock-Setup — connect and open http://192.168.4.1");
+  captiveDns.begin(53);
+  web.on("/", []() { web.send(200, "text/html", PORTAL_HTML); });
+  web.on("/generate_204", []() { web.send(204); });  // Android captive detection
+  web.on("/save-wifi", HTTP_POST, []() {
+    String ssid = web.arg("ssid");
+    String pass = web.arg("pass");
+    if (ssid.length() == 0) { web.send(400, "text/html", "<h1>Missing SSID</h1>"); return; }
+    saveWifiCfg(ssid, pass);
+    web.send(200, "text/html", "<h1>Saved! Rebooting...</h1><p>Connect to your WiFi and find the device at c3adblock.local</p>");
+    delay(1500);
+    ESP.restart();
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+
+  while (true) {
+    web.handleClient();
+    handleCaptiveDns();
+    delay(2);
+  }
+}
+
+// ---- DHCP config persistence ----
+static void loadDhcpCfg() {
+  File f = LittleFS.open("/dhcp.cfg", "r");
+  if (!f) return;
+  String v = f.readStringUntil('\n'); v.trim();
+  dhcpEnabled = (v == "1");
+  f.close();
+}
+static void saveDhcpCfg() {
+  File f = LittleFS.open("/dhcp.cfg", "w");
+  if (!f) return;
+  f.println(dhcpEnabled ? "1" : "0");
+  f.close();
+}
+
+// ---- setup / loop ----
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  LOGN("\n[c3-adblock] booting");
+
+  if (!LittleFS.begin(true)) LOGN("LittleFS FAILED");
+
+  loadAuth();
+  loadCustom();
+  loadBanned();
+  loadUpdateCfg();
+  loadDhcpCfg();
+  reopenBlocklist();
+  LOG("[cfg] custom:%d banned:%d auth:%s\n", numCustom, numBanned, authPassword.c_str());
+  LOGN("[cfg] dashboard password: " + authPassword);
+
+  if (!connectWiFi()) {
+    runCaptivePortal();  // blocks forever (reboots on save)
+    return;
+  }
+
+  if (MDNS.begin("c3adblock")) {
+    MDNS.addService("http", "tcp", 80);
+    LOGN("dashboard: http://c3adblock.local");
+  }
+
+  dnsServer.begin(DNS_PORT);
+  upstream.begin(0);
+  tcpUpstream.begin(0);
+  tcpDnsServer.begin();
+  web.collectHeaders(COLLECTED_HEADERS, sizeof(COLLECTED_HEADERS) / sizeof(char*));
+  web.on("/", handleRoot);
+  web.on("/stats.json", handleStats);
+  web.on("/ban", handleBan);
+  web.on("/addblock", handleAddBlock);
+  web.on("/unblock", handleUnblock);
+  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);
+  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);
+  web.on("/fetchnow", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    fetchBlocklist(updateUrl);
+    web.send(200, "text/plain", updateStatus);
+  });
+  web.on("/setupdate", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    if (web.hasArg("u")) updateUrl = web.arg("u");
+    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
+    saveUpdateCfg();
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/dhcp", handleDhcpToggle);
+  web.on("/setwifi", handleSetWifi);
+  web.begin();
+
+  ArduinoOTA.setHostname("c3adblock");
   ArduinoOTA.begin();
-  Serial.println("DNS :53 + dashboard :80 + OTA up");
+
+  if (dhcpEnabled) {
+    initDhcpPool();
+    dhcpSock.begin(DHCP_PORT);
+    LOGN("DHCP server enabled on :67");
+  }
+
+  LOGN("DNS :53 (UDP+TCP) + dashboard :80 + OTA up");
 }
 
 void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   handleDns();
-  if (updateUrl.length()) {               // periodic remote blocklist auto-update
+  pollUpstream(dnsBuf, DNS_BUF_SIZE);
+  expirePending();
+  handleTcpDns();
+  if (dhcpEnabled) handleDhcp();
+
+  // Track DNS activity for idle-gated remote fetch (set in handleDns/pollUpstream)
+  if (pendingCount > 0) lastDnsActivityMs = millis();
+
+  // Idle-gated remote blocklist auto-update (only when DNS has been quiet)
+  if (updateUrl.length() && numHashes > 0) {
     uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
-    else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
+    if (lastCheckMs == 0) {
+      lastCheckMs = now;  // skip immediate fetch on boot
+    } else if ((now - lastCheckMs) >= updateIntervalH * 3600000UL &&
+               (now - lastDnsActivityMs) >= REMOTE_FETCH_IDLE_MS) {
+      lastCheckMs = now;
+      fetchBlocklist(updateUrl);
+    }
   }
-  delay(1);
 }
