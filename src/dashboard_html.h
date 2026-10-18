@@ -18,7 +18,7 @@ button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:5
 button:hover{background:#30363d}.ban{color:#f85149}input,select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:5px;padding:6px}
 h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 </style></head><body>
-<header><h1>C3 AdBlock <span id=host></span></h1></header><div class=wrap>
+<header><h1>C3 AdBlock <span id=fwver style="font-size:12px;color:#8b949e;font-weight:normal">v1.0.1</span> <span id=host></span></h1></header><div class=wrap>
 <div class=cards id=sys></div>
 <h2>CLIENTS</h2><table id=ct><thead><tr><th>Client</th><th>MAC</th><th>Blocked</th><th>Allowed</th><th></th></tr></thead><tbody></tbody></table>
 <h2>CUSTOM BLOCKED DOMAINS</h2>
@@ -28,7 +28,7 @@ h2{font-size:14px;color:#8b949e;margin:18px 0 8px}
 <form id=upf style=margin-bottom:6px><input type=file id=blf accept=.bin><button>Upload blocklist</button> <span id=upmsg style=color:#8b949e></span></form>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">build <code>blocklist.bin</code> with <code>tools/build_blocklist.py</code>, then upload here &mdash; no USB</div>
 <h2>BLOCKLIST &mdash; REMOTE AUTO-UPDATE</h2>
-<div style=margin-bottom:6px><input id=uurl placeholder="https://host/blocklist.bin" size=40> every <input id=uiv size=2 value=24>h
+<div style=margin-bottom:6px><input id=uurl placeholder="https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin" size=45> every <input id=uiv size=2 value=24>h
 <button onclick=saveUpd()>Save</button> <button onclick=fetchNow()>Fetch now</button></div>
 <div style="color:#8b949e;font-size:12px;margin-bottom:18px">device pulls a prebuilt <code>blocklist.bin</code> on a schedule. last: <span id=ustat>&mdash;</span></div>
 <h2>DHCP SERVER <span id=dhcpst class=tag></span></h2>
@@ -60,9 +60,10 @@ function mut(p){return p+(p.includes('?')?'&':'?')+'token='+T}
 async function load(){let s=await(await fetch('/stats.json')).json();
 T=s.token||'';
 host.textContent='@ '+s.ip;
+if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
 ['Bloom',s.bloom||'off',''],['Pending',s.pending||0,''],['Clients',s.clients.length,''],
-['WiFi',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.1'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
@@ -85,8 +86,8 @@ wmsg.textContent='saving...';fetch(mut('/setwifi?ssid='+encodeURIComponent(s)+'&
 function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch(mut('/settxpower?p='+encodeURIComponent(p))).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch(mut('/update'),{method:'POST',body:fd});fwmsg.textContent=r.ok?'rebooting, reconnect in ~15s':'failed: '+await r.text();}
-catch(_){fwmsg.textContent='rebooting, reconnect in ~15s';}};
+try{let r=await fetch(mut('/update'),{method:'POST',body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
+catch(err){fwmsg.textContent='err: '+err.message;}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);

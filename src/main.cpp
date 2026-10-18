@@ -59,7 +59,8 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* DASHBOARD_ETAG = "c3adb-v2";
+static const char* FIRMWARE_VERSION = "1.0.1";
+static const char* DASHBOARD_ETAG = "c3adb-v101";
 
 // ---- WiFi TX power & thermal configuration ----
 struct TxPowerOpt {
@@ -503,7 +504,7 @@ static bool handleTcpDns() {
     if (!tcpDnsClient) return false;
   }
   if (!tcpDnsClient.connected()) return false;
-  if (tcpDnsClient.available() < 2) return true;
+  if (tcpDnsClient.available() < 2) return false;
 
   uint8_t lenBuf[2];
   tcpDnsClient.read(lenBuf, 2);
@@ -742,7 +743,8 @@ static void handleStats() {
   snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String bloomStr = bloomFilter ? (String(bloomBits / 8 / 1024) + " KB") : String("off");
 
-  String j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked +
+  String j = "{\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
+             ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked +
              ",\"allowed\":" + totalAllowed + ",\"domains\":" + numHashes +
              ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
@@ -926,13 +928,19 @@ static void handleUpload() {
 
 // ---- remote blocklist auto-update ----
 
+static const char* DEFAULT_UPDATE_URL = "https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin";
+
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r");
-  if (!f) return;
+  if (!f) {
+    updateUrl = DEFAULT_UPDATE_URL;
+    return;
+  }
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim();
   if (iv.length()) updateIntervalH = iv.toInt();
   f.close();
+  if (!updateUrl.length()) updateUrl = DEFAULT_UPDATE_URL;
   if (updateIntervalH < 1) updateIntervalH = 1;
 }
 static void saveUpdateCfg() {
@@ -942,45 +950,81 @@ static void saveUpdateCfg() {
 }
 static bool fetchBlocklist(String url) {
   url.trim();
-  if (!url.length()) { updateStatus = "no url set"; return false; }
-  LOG("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs;
-  cs.setInsecure();  // Accept arbitrary HTTPS hosts without local root CA store or NTP time sync
-  WiFiClient cl;
-  HTTPClient http;
-  http.setTimeout(25000);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) {
-    updateStatus = "begin failed"; return false;
-  }
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end(); updateStatus = "HTTP " + String(code);
+  if (!url.length()) url = DEFAULT_UPDATE_URL;
+  String currentUrl = url;
+  const int maxHops = 5;
+  const char* headerKeys[] = {"Location"};
+
+  for (int hop = 0; hop < maxHops; hop++) {
+    LOG("[remote] hop %d GET %s\n", hop, currentUrl.c_str());
+    WiFiClientSecure cs;
+    cs.setInsecure();  // Accept arbitrary HTTPS hosts without local root CA store or NTP time sync
+    WiFiClient cl;
+    HTTPClient http;
+    http.setTimeout(25000);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.collectHeaders(headerKeys, 1);
+
+    bool https = currentUrl.startsWith("https");
+    if (!(https ? http.begin(cs, currentUrl) : http.begin(cl, currentUrl))) {
+      updateStatus = "begin failed"; return false;
+    }
+
+    int code = http.GET();
+    if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+        code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT || code == 308) {
+      String loc = http.header("Location");
+      http.end();
+      if (!loc.length()) {
+        updateStatus = "redirect with no Location";
+        LOG("[remote] %s\n", updateStatus.c_str());
+        return false;
+      }
+      if (loc.startsWith("/")) {
+        int slashIdx = currentUrl.indexOf('/', currentUrl.indexOf("://") + 3);
+        if (slashIdx > 0) currentUrl = currentUrl.substring(0, slashIdx) + loc;
+        else currentUrl = currentUrl + loc;
+      } else {
+        currentUrl = loc;
+      }
+      continue;
+    }
+
+    if (code != HTTP_CODE_OK) {
+      http.end();
+      updateStatus = "HTTP " + String(code);
+      LOG("[remote] %s\n", updateStatus.c_str());
+      return false;
+    }
+
+    beginBlocklistSwap();
+    File f = LittleFS.open("/blocklist.new", "w");
+    if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+    int written = http.writeToStream(&f);
+    f.close();
+    http.end();
+    if (written < 0) {
+      updateStatus = "stream write failed (" + String(written) + ")";
+      LOG("[remote] %s\n", updateStatus.c_str());
+      reopenBlocklist();
+      return false;
+    }
+    bool ok = commitNewBlocklist();
+    updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(written) + "B)");
     LOG("[remote] %s\n", updateStatus.c_str());
-    return false;
+    return ok;
   }
-  beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
-  int written = http.writeToStream(&f);
-  f.close(); http.end();
-  if (written < 0) {
-    updateStatus = "stream write failed (" + String(written) + ")";
-    LOG("[remote] %s\n", updateStatus.c_str());
-    reopenBlocklist();
-    return false;
-  }
-  bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(written) + "B)");
+
+  updateStatus = "too many redirects";
   LOG("[remote] %s\n", updateStatus.c_str());
-  return ok;
+  return false;
 }
 
 // ---- firmware OTA ----
 static void handleFwUpdateDone() {
   bool ok = !Update.hasError();
-  web.send(ok ? 200 : 500, "text/plain", ok ? "ok, rebooting" : "firmware update failed");
+  String msg = ok ? "ok, rebooting" : ("firmware update failed (error " + String(Update.getError()) + ")");
+  web.send(ok ? 200 : 500, "text/plain", msg);
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
