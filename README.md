@@ -4,6 +4,11 @@
   <img src="docs/banner.jpg" alt="9M2PJU ESP32-C3 AdBlocker" width="100%">
 </p>
 
+<p align="center">
+  <a href="https://buymeacoffee.com/9m2pju"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-9m2pju-orange?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me A Coffee"></a>
+  <a href="https://www.paypal.com/donate/?business=9m2pju@hamradio.my"><img src="https://img.shields.io/badge/Donate-PayPal-blue?style=for-the-badge&logo=paypal" alt="Donate with PayPal"></a>
+</p>
+
 A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
 
 The trick everyone misses: you don't need to keep the blocklist in RAM. Store the
@@ -438,6 +443,13 @@ Releases with auto-generated release notes. Assets:
 - ⬜ Per-client blocking rules (different blocklists for different devices)
 - ⬜ Allowlist (override blocklist for specific domains)
 - ⬜ Query logging / export
+
+## Support & Sponsoring
+
+If you find this project useful and would like to support maintenance and development:
+
+- **Buy Me a Coffee**: [buymeacoffee.com/9m2pju](https://buymeacoffee.com/9m2pju)
+- **PayPal**: [Donate via PayPal (9m2pju@hamradio.my)](https://www.paypal.com/donate/?business=9m2pju@hamradio.my)
 
 ## Credits
 
