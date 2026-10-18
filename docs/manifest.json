@@ -7,19 +7,19 @@
       "chipFamily": "ESP32-C3",
       "parts": [
         {
-          "path": "https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/bootloader.bin",
+          "path": "bootloader.bin",
           "offset": 0
         },
         {
-          "path": "https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/partitions.bin",
+          "path": "partitions.bin",
           "offset": 32768
         },
         {
-          "path": "https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/firmware.bin",
+          "path": "firmware.bin",
           "offset": 65536
         },
         {
-          "path": "https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/blocklist-fs.bin",
+          "path": "blocklist-fs.bin",
           "offset": 2818048
         }
       ]
