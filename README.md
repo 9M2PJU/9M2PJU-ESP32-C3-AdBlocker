@@ -19,6 +19,10 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.4** — diagnosable remote fetch (no more bare `HTTP -1`: DNS pre-check,
+  `errorToString` + `wifi/rssi/heap` in status, 60 s timeout, 30 s TLS handshake
+  cap); **cooler idle** (`WIFI_PS_MIN_MODEM` modem sleep — TX power alone only
+  saves 1–3 °C); honest thermal docs.
 - **v1.0.3** — **ECDSA-signed blocklist updates** (`--sign-key` → `.sig`, mbedTLS
   verify on device, `<url>.sig` auto-fetch, dashboard signed/UNVERIFIED badge +
   require-signed toggle); **CSRF token via `X-CSRF-Token` header only**
@@ -367,9 +371,13 @@ The dashboard at **http://c3adblock.local** does it all:
   lists — keeping the live list on any failure. The dashboard shows whether the
   live list is `signed` or `UNVERIFIED` and lets you toggle "require-signed".
 - **WiFi & Thermals** — change the WiFi network and configure WiFi TX power (from 2 dBm
-  up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Lower TX power combined
-  with automatic CPU idle yielding keeps the ESP32-C3 SuperMini cool (~35–45 °C) and
-  protects the onboard 3.3V voltage regulator from overheating.
+  up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Modem sleep
+  (`WIFI_PS_MIN_MODEM`) + CPU idle yielding are the main idle coolers; lower TX
+  power only trims TX bursts (~1–3 °C). Expect ~45–55 °C on a SuperMini in a case —
+  keep vents open, antenna clear, and use a stable 5V/1A supply. If `RSSI < -70 dBm`,
+  raise TX instead: a weak signal causes retries (more heat + failed fetches).
+  Remote-fetch failures now report `HTTP -1 (connection refused) [wifi:up rssi:-xx heap:xxk]`
+  or `DNS failed for <host>` so heap vs DNS vs TLS is distinguishable in serial + dashboard.
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
   ```bash

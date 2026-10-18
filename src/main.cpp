@@ -68,7 +68,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.3";
+static const char* FIRMWARE_VERSION = "1.0.4";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -1191,15 +1191,47 @@ static void saveUpdateCfg() {
   if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
+static String httpErrStr(int code) {
+  if (code > 0) return String(code);
+  String s = HTTPClient::errorToString(code);
+  if (s.length()) return String(code) + " (" + s + ")";
+  return String(code);
+}
+static String netDiag() {
+  return "wifi:" + String(WiFi.status() == WL_CONNECTED ? "up" : "down") +
+         " rssi:" + String(WiFi.RSSI()) + " heap:" + String(ESP.getFreeHeap() / 1024) + "k";
+}
 static bool fetchBlocklist(String url) {
   url.trim();
   if (!url.length()) url = DEFAULT_UPDATE_URL;
+  if (WiFi.status() != WL_CONNECTED) {
+    updateStatus = "wifi not connected [" + netDiag() + "]";
+    LOG("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
   String currentUrl = url;
   const int maxHops = 5;
   const char* headerKeys[] = {"Location"};
 
   for (int hop = 0; hop < maxHops; hop++) {
-    LOG("[remote] hop %d GET %s\n", hop, currentUrl.c_str());
+    LOG("[remote] hop %d GET %s [%s]\n", hop, currentUrl.c_str(), netDiag().c_str());
+    // Fast DNS pre-check so a resolver loop shows up as "DNS failed"
+    // instead of a cryptic HTTP -1.
+    {
+      int schemeEnd = currentUrl.indexOf("://");
+      String host = currentUrl.substring(schemeEnd >= 0 ? schemeEnd + 3 : 0);
+      int slash = host.indexOf('/');
+      if (slash > 0) host = host.substring(0, slash);
+      int colon = host.indexOf(':');
+      if (colon > 0) host = host.substring(0, colon);
+      IPAddress resolved;
+      if (host.length() && WiFi.hostByName(host.c_str(), resolved) != 1) {
+        updateStatus = "DNS failed for " + host + " [" + netDiag() + "]";
+        LOG("[remote] %s\n", updateStatus.c_str());
+        return false;
+      }
+      LOG("[remote] %s -> %s\n", host.c_str(), resolved.toString().c_str());
+    }
     WiFiClientSecure cs;
     // NOTE: no CA verification (setInsecure). The C3 has no system clock/DST
     // root store for full chain validation without NTP + bundled roots, so a
@@ -1208,15 +1240,17 @@ static bool fetchBlocklist(String url) {
     // live list is kept on any failure. For high assurance, upload
     // blocklist.bin manually via the dashboard instead of remote pull.
     cs.setInsecure();
+    cs.setHandshakeTimeout(30);  // default is 120 s — don't stall DNS that long
     WiFiClient cl;
     HTTPClient http;
-    http.setTimeout(25000);
+    http.setTimeout(60000);  // 700 KB over slow WiFi + LittleFS writes needs >25 s
+    http.setReuse(false);    // free the socket immediately (redirect + .sig hops)
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.collectHeaders(headerKeys, 1);
 
     bool https = currentUrl.startsWith("https");
     if (!(https ? http.begin(cs, currentUrl) : http.begin(cl, currentUrl))) {
-      updateStatus = "begin failed"; return false;
+      updateStatus = "begin failed [" + netDiag() + "]"; return false;
     }
 
     int code = http.GET();
@@ -1248,7 +1282,7 @@ static bool fetchBlocklist(String url) {
 
     if (code != HTTP_CODE_OK) {
       http.end();
-      updateStatus = "HTTP " + String(code);
+      updateStatus = "HTTP " + httpErrStr(code) + " [" + netDiag() + "]";
       LOG("[remote] %s\n", updateStatus.c_str());
       return false;
     }
@@ -1271,8 +1305,10 @@ static bool fetchBlocklist(String url) {
     {
       WiFiClientSecure cs2;
       cs2.setInsecure();  // same trust model as above; ECDSA verify is the real gate
+      cs2.setHandshakeTimeout(20);
       HTTPClient sigHttp;
-      sigHttp.setTimeout(15000);
+      sigHttp.setTimeout(30000);
+      sigHttp.setReuse(false);
       sigHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
       bool sigBegun = binUrl.startsWith("https") ? sigHttp.begin(cs2, binUrl + ".sig")
                                                  : sigHttp.begin(binUrl + ".sig");
@@ -1354,7 +1390,12 @@ static bool connectWiFi() {
   if (!trySsid) return false;
 
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  // MIN_MODEM (modem sleep) is the biggest idle-thermal win: the radio naps
+  // between beacons instead of staying fully powered (WIFI_PS_NONE). Cost is
+  // ~50-100 ms extra latency on the first packet after idle, which DNS
+  // tolerates (2 s client timeout). TX power only affects TX bursts (<5%
+  // duty), so it alone moves idle temp by 1-3 C.
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
   WiFi.begin(trySsid, tryPass);
   applyTxPower(txPowerSetting);
   LOG("WiFi: connecting to %s", trySsid);
@@ -1580,8 +1621,9 @@ void loop() {
   }
 
   // Yield CPU to FreeRTOS idle task when there is no active traffic.
-  // This allows the RISC-V core to enter the low-power WFI sleep state,
-  // dropping idle power and CPU temperature dramatically (by 20-30 °C).
+  // This allows the RISC-V core to enter the low-power WFI sleep state.
+  // Combined with WIFI_PS_MIN_MODEM (see connectWiFi) this is the main idle
+  // cooler; TX power alone only affects TX bursts.
   if (!busy) {
     delay(1);
   }

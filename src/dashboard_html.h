@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.0.3</span>
+    <span class=badge id=fwver>v1.0.4</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -188,7 +188,7 @@ T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.3'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.4'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
 ['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
 ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
