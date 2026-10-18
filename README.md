@@ -19,6 +19,13 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.5** — fixed GitHub Releases blocklist fetch: `.sig` is now fetched
+  next to the *original* URL (not the signed `release-assets` redirect URL
+  with `?sp=r&sig=...` query, which always 404'd) **and** follows redirects
+  itself, so `.../releases/latest/download/blocklist.bin` (+ `.sig`) works;
+  `raw.githubusercontent.com/.../releases/...` is rejected with a helpful
+  message (raw only serves git files, never release assets); explicit
+  `User-Agent`, protocol-relative redirect support.
 - **v1.0.4** — diagnosable remote fetch (no more bare `HTTP -1`: DNS pre-check,
   `errorToString` + `wifi/rssi/heap` in status, 60 s timeout, 30 s TLS handshake
   cap); **cooler idle** (`WIFI_PS_MIN_MODEM` modem sleep — TX power alone only
@@ -362,8 +369,14 @@ The dashboard at **http://c3adblock.local** does it all:
 - **Blocklist** — drop a freshly built `blocklist.bin` (+ optional `.sig` from
   `--sign-key`) into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  (+ `<url>.sig` when published) on a schedule (e.g. a GitHub release asset —
-  update it once, every device fetches it).
+  (+ `<url>.sig` when published) on a schedule. Good URLs:
+  `https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin` (GitHub
+  Pages — fastest on the C3, no redirect) or
+  `https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/blocklist.bin`
+  (follows the `github.com → release-assets` redirect chain, `.sig` too).
+  Do **not** use `raw.githubusercontent.com/.../releases/...` — raw only serves
+  files committed to git, so every release-asset path 404s there (the firmware
+  now says so explicitly instead of a bare `HTTP 404`).
   Remote fetches support HTTPS with redirect-following (ideal for GitHub releases) and
   only *start* when DNS has been idle for 3+ seconds. Note: the download itself
   still pauses DNS for several seconds — schedule off-peak. Validation rejects

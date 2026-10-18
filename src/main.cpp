@@ -68,7 +68,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.4";
+static const char* FIRMWARE_VERSION = "1.0.5";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -1201,6 +1201,57 @@ static String netDiag() {
   return "wifi:" + String(WiFi.status() == WL_CONNECTED ? "up" : "down") +
          " rssi:" + String(WiFi.RSSI()) + " heap:" + String(ESP.getFreeHeap() / 1024) + "k";
 }
+// Append ".sig" to a blocklist URL without corrupting any ?query/#fragment.
+// (GitHub release redirects land on signed release-assets URLs like
+// ".../uuid?sp=r&sig=...&jwt=..." — appending ".sig" to THAT would just
+// 404. The signature lives next to the original URL, e.g.
+// ".../releases/latest/download/blocklist.bin.sig".)
+static String sigUrlFor(const String& base) {
+  String s = base;
+  s.trim();
+  int q = s.indexOf('?');
+  if (q >= 0) s = s.substring(0, q);
+  int h = s.indexOf('#');
+  if (h >= 0) s = s.substring(0, h);
+  if (!s.endsWith(".sig")) s += ".sig";
+  return s;
+}
+// raw.githubusercontent.com only serves files committed to git (e.g.
+// StevenBlack hosts). Release assets are NOT there — that host 404s for
+// any /releases/... path. Catch it early with a helpful message instead
+// of a bare "HTTP 404".
+static bool isRawReleaseUrl(const String& u) {
+  return u.indexOf("raw.githubusercontent.com") >= 0 && u.indexOf("/releases/") >= 0;
+}
+// Resolve a Location header against the request URL (RFC 9110 10.2.2).
+static String resolveRedirect(const String& base, String loc) {
+  loc.trim();
+  if (loc.startsWith("//")) {
+    int schemeEnd = base.indexOf("://");
+    String scheme = (schemeEnd > 0) ? base.substring(0, schemeEnd) : "https";
+    return scheme + ":" + loc;
+  }
+  if (loc.startsWith("/")) {
+    int slashIdx = base.indexOf('/', base.indexOf("://") + 3);
+    if (slashIdx > 0) return base.substring(0, slashIdx) + loc;
+    return base + loc;
+  }
+  if (loc.indexOf("://") > 0) return loc;  // absolute URL
+  // Relative reference ("other.bin" / "blocklist.bin.sig"): resolve against
+  // the request path, ignoring any ?query on the base URL.
+  String nosq = base;
+  int q = nosq.indexOf('?');
+  if (q >= 0) nosq = nosq.substring(0, q);
+  int hh = nosq.indexOf('#');
+  if (hh >= 0) nosq = nosq.substring(0, hh);
+  int lastSlash = nosq.lastIndexOf('/');
+  if (lastSlash > nosq.indexOf("://") + 2)
+    return nosq.substring(0, lastSlash + 1) + loc;
+  return nosq + "/" + loc;
+}
+static String fwUserAgent() {
+  return String("C3AdBlock/") + FIRMWARE_VERSION + " ESP32HTTPClient";
+}
 static bool fetchBlocklist(String url) {
   url.trim();
   if (!url.length()) url = DEFAULT_UPDATE_URL;
@@ -1209,9 +1260,17 @@ static bool fetchBlocklist(String url) {
     LOG("[remote] %s\n", updateStatus.c_str());
     return false;
   }
-  String currentUrl = url;
-  const int maxHops = 5;
-  const char* headerKeys[] = {"Location"};
+  String requestedUrl = url;
+  if (isRawReleaseUrl(requestedUrl)) {
+    updateStatus = "raw.githubusercontent.com can't serve release assets (HTTP 404) — use "
+                   "https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/blocklist.bin "
+                   "or the GitHub Pages URL [" + netDiag() + "]";
+    LOG("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
+  String currentUrl = requestedUrl;
+  const int maxHops = 6;  // github latest -> versioned -> release-assets = 2 hops; keep headroom
+  static const char* headerKeys[] = {"Location"};
 
   for (int hop = 0; hop < maxHops; hop++) {
     LOG("[remote] hop %d GET %s [%s]\n", hop, currentUrl.c_str(), netDiag().c_str());
@@ -1247,6 +1306,7 @@ static bool fetchBlocklist(String url) {
     http.setReuse(false);    // free the socket immediately (redirect + .sig hops)
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.collectHeaders(headerKeys, 1);
+    http.setUserAgent(fwUserAgent());
 
     bool https = currentUrl.startsWith("https");
     if (!(https ? http.begin(cs, currentUrl) : http.begin(cl, currentUrl))) {
@@ -1263,26 +1323,17 @@ static bool fetchBlocklist(String url) {
         LOG("[remote] %s\n", updateStatus.c_str());
         return false;
       }
-      if (loc.startsWith("/")) {
-        int slashIdx = currentUrl.indexOf('/', currentUrl.indexOf("://") + 3);
-        if (slashIdx > 0) currentUrl = currentUrl.substring(0, slashIdx) + loc;
-        else currentUrl = currentUrl + loc;
-      } else if (loc.indexOf("://") > 0) {
-        currentUrl = loc;  // absolute URL
-      } else {
-        // Relative reference ("other.bin"): resolve against the current path.
-        int lastSlash = currentUrl.lastIndexOf('/');
-        if (lastSlash > currentUrl.indexOf("://") + 2)
-          currentUrl = currentUrl.substring(0, lastSlash + 1) + loc;
-        else
-          currentUrl = currentUrl + "/" + loc;
-      }
+      currentUrl = resolveRedirect(currentUrl, loc);
+      LOG("[remote] redirect -> %s\n", currentUrl.c_str());
       continue;
     }
 
     if (code != HTTP_CODE_OK) {
       http.end();
-      updateStatus = "HTTP " + httpErrStr(code) + " [" + netDiag() + "]";
+      String hint;
+      if (code == 404 && currentUrl.indexOf("raw.githubusercontent.com") >= 0)
+        hint = " (raw.githubusercontent.com only serves git files, not release assets)";
+      updateStatus = "HTTP " + httpErrStr(code) + hint + " [" + netDiag() + "]";
       LOG("[remote] %s\n", updateStatus.c_str());
       return false;
     }
@@ -1292,8 +1343,12 @@ static bool fetchBlocklist(String url) {
     if (!f) { http.end(); updateStatus = "fs open failed"; return false; }
     int written = http.writeToStream(&f);
     f.close();
-    // Best-effort companion signature (<final-url>.sig). Absent on servers
-    // that don't publish one — then the requireSigned policy decides.
+    // Best-effort companion signature. The .sig lives next to the ORIGINAL
+    // URL (e.g. .../releases/latest/download/blocklist.bin.sig, which itself
+    // 302s to a signed release-assets URL) — NOT next to the final redirected
+    // bin URL, which already carries ?sp=r&sig=...&jwt=... query params that
+    // would be corrupted by a naive + ".sig". Follow redirects for the .sig
+    // too; absent on servers that don't publish one (requireSigned decides).
     String binUrl = currentUrl;
     http.end();
     if (written < 0) {
@@ -1303,25 +1358,55 @@ static bool fetchBlocklist(String url) {
       return false;
     }
     {
-      WiFiClientSecure cs2;
-      cs2.setInsecure();  // same trust model as above; ECDSA verify is the real gate
-      cs2.setHandshakeTimeout(20);
-      HTTPClient sigHttp;
-      sigHttp.setTimeout(30000);
-      sigHttp.setReuse(false);
-      sigHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-      bool sigBegun = binUrl.startsWith("https") ? sigHttp.begin(cs2, binUrl + ".sig")
-                                                 : sigHttp.begin(binUrl + ".sig");
-      if (sigBegun && sigHttp.GET() == HTTP_CODE_OK) {
-        File sf = LittleFS.open("/blocklist.new.sig", "w");
-        if (sf) {
-          sigHttp.writeToStream(&sf);
-          sf.close();
-          if (LittleFS.open("/blocklist.new.sig", "r").size() == 0)
-            LittleFS.remove("/blocklist.new.sig");
+      // Candidates in order: signature next to the user-entered URL, then
+      // next to the final bin URL (covers direct links that already went
+      // through a redirect, e.g. a versioned /releases/download/vX/ URL).
+      String candidates[2] = { sigUrlFor(requestedUrl), sigUrlFor(binUrl) };
+      for (int ci = 0; ci < 2; ci++) {
+        if (ci == 1 && candidates[1] == candidates[0]) break;  // same URL, don't refetch
+        String sigUrl = candidates[ci];
+        LOG("[remote] sig try %s\n", sigUrl.c_str());
+        for (int shop = 0; shop < 5; shop++) {
+          WiFiClientSecure cs2;
+          cs2.setInsecure();  // same trust model as above; ECDSA verify is the real gate
+          cs2.setHandshakeTimeout(20);
+          WiFiClient cl2;
+          HTTPClient sigHttp;
+          sigHttp.setTimeout(30000);
+          sigHttp.setReuse(false);
+          sigHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+          sigHttp.collectHeaders(headerKeys, 1);
+          sigHttp.setUserAgent(fwUserAgent());
+          bool isHttps = sigUrl.startsWith("https");
+          if (!(isHttps ? sigHttp.begin(cs2, sigUrl) : sigHttp.begin(cl2, sigUrl))) break;
+          int scode = sigHttp.GET();
+          if (scode == HTTP_CODE_MOVED_PERMANENTLY || scode == HTTP_CODE_FOUND ||
+              scode == HTTP_CODE_SEE_OTHER || scode == HTTP_CODE_TEMPORARY_REDIRECT || scode == 308) {
+            String sloc = sigHttp.header("Location");
+            sigHttp.end();
+            if (!sloc.length()) break;
+            sigUrl = resolveRedirect(sigUrl, sloc);
+            continue;
+          }
+          if (scode == HTTP_CODE_OK) {
+            File sf = LittleFS.open("/blocklist.new.sig", "w");
+            if (sf) {
+              sigHttp.writeToStream(&sf);
+              sf.close();
+              File chk = LittleFS.open("/blocklist.new.sig", "r");
+              size_t csz = chk ? chk.size() : 0;
+              if (chk) chk.close();
+              if (csz == 0)
+                LittleFS.remove("/blocklist.new.sig");
+              else
+                LOG("[remote] got sig (%u bytes)\n", (unsigned)csz);
+            }
+          }
+          sigHttp.end();
+          break;  // non-redirect response: stop following this candidate
         }
+        if (LittleFS.exists("/blocklist.new.sig")) break;  // got one, stop
       }
-      sigHttp.end();
     }
     bool ok = commitNewBlocklist();
     updateStatus = ok ? swapStatus : ("rejected: " + swapStatus);
