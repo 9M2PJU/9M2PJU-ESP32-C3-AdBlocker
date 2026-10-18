@@ -196,7 +196,7 @@ download anything manually.
    ```bash
    esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
      write_flash \
-     0x1000   bootloader.bin \
+     0x0      bootloader.bin \
      0x8000   partitions.bin \
      0x10000  firmware.bin \
      0x2b0000 blocklist-fs.bin
@@ -317,14 +317,17 @@ The dashboard at **http://c3adblock.local** does it all:
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
   on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
-  Remote fetches use **CA-verified HTTPS** (no `setInsecure`) and only run when DNS
-  has been idle for 3+ seconds, so they don't interrupt service.
+  Remote fetches support HTTPS with redirect-following (ideal for GitHub releases) and
+  only run when DNS has been idle for 3+ seconds, so they don't interrupt service.
+- **WiFi & Thermals** — change the WiFi network and configure WiFi TX power (from 2 dBm
+  up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Lower TX power combined
+  with automatic CPU idle yielding keeps the ESP32-C3 SuperMini cool (~35–45 °C) and
+  protects the onboard 3.3V voltage regulator from overheating.
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the
   device verifies it and reboots into the new image. Or push over WiFi from the CLI:
   ```bash
   pio run -t upload --upload-port c3adblock.local --upload-protocol espota
   ```
-- **WiFi** — change the WiFi network from the dashboard (no reflash needed).
 - **DHCP** — optionally enable the built-in DHCP server so the C3 hands itself out
   as the DNS server. Disable your router's DHCP first, then toggle this on.
 

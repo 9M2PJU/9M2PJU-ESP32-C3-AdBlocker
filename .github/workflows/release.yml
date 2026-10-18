@@ -51,14 +51,14 @@ jobs:
           cp data/blocklist.bin release/blocklist.bin
           # Combined flashable image (bootloader + partitions + firmware + fs)
           # Offsets must match partitions.csv:
-          #   bootloader: 0x1000 (esptool default for C3)
+          #   bootloader: 0x0 (esptool default for C3)
           #   partitions: 0x8000
           #   firmware:   0x10000
           #   fs:         0x2b0000
           ESPTOOL=$(find ~/.platformio/packages -name esptool.py -path '*tool-esptoolpy*' | head -1)
           python3 "$ESPTOOL" --chip esp32c3 merge_bin -o release/full-flash.bin \
             --flash_mode dio --flash_size 4MB \
-            0x1000 release/bootloader.bin \
+            0x0 release/bootloader.bin \
             0x8000 release/partitions.bin \
             0x10000 release/firmware.bin \
             0x2b0000 release/blocklist-fs.bin

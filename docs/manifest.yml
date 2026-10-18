@@ -1,14 +1,15 @@
 name: 9M2PJU ESP32-C3 AdBlocker
+version: "1.0.0"
 new_install_prompt_erase: true
 builds:
   - name: esp32-c3
     chipFamily: ESP32-C3
-    images:
+    parts:
       - path: https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/bootloader.bin
-        offset: 0x1000
+        offset: 0
       - path: https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/partitions.bin
-        offset: 0x8000
+        offset: 32768
       - path: https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/firmware.bin
-        offset: 0x10000
+        offset: 65536
       - path: https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/blocklist-fs.bin
-        offset: 0x2b0000
+        offset: 2818048

@@ -41,7 +41,7 @@ code{background:#21262d;border-radius:4px;padding:2px 6px;font-size:13px}
 <p class="sub">Flash directly from your browser — no software install needed.</p>
 
 <div class="flash-box">
-<esp-web-install-button manifest="manifest.yml"></esp-web-install-button>
+<esp-web-install-button manifest="manifest.json"></esp-web-install-button>
 <p>Click <b>CONNECT</b> and select your ESP32-C3's serial port.</p>
 </div>
 
@@ -108,7 +108,7 @@ at boot (look for <code>[cfg] dashboard password:</code>).</p>
 <div class="card">
 <h2>What gets flashed</h2>
 <ol>
-<li><b>Bootloader</b> (offset <code>0x1000</code>) — ESP32-C3 bootloader</li>
+<li><b>Bootloader</b> (offset <code>0x0</code>) — ESP32-C3 bootloader</li>
 <li><b>Partition table</b> (offset <code>0x8000</code>) — dual-OTA + LittleFS layout</li>
 <li><b>Firmware</b> (offset <code>0x10000</code>) — the ad-blocker application</li>
 <li><b>Blocklist filesystem</b> (offset <code>0x2b0000</code>) — ~140k blocked domains
