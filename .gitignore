@@ -4,9 +4,14 @@
 
 # Generated blocklist (build it with tools/build_blocklist.py)
 data/blocklist.bin
+data/blocklist.sig
 
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h
+
+# Blocklist signing private key — NEVER commit this
+tools/blocklist_signing.key
+*.pem
 
 # Backups / scratch
 *.bak

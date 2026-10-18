@@ -11,7 +11,8 @@
 //  - Bloom filter pre-filter in RAM
 //  - AAAA sinkhole (blocked IPv6 queries answered with ::, not leaked)
 //  - TCP DNS on port 53
-//  - Dashboard auth (Basic Auth + CSRF token)
+//  - Dashboard auth (Basic Auth + header CSRF token + brute-force brake)
+//  - Signed blocklist updates (ECDSA P-256, optional enforcement)
 //  - Client table with LRU eviction
 //  - Decoupled ban storage (independent of client table)
 //  - Idle-gated remote blocklist fetch (deferred until DNS is quiet;
@@ -43,14 +44,20 @@
 #include <ArduinoOTA.h>
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/ecdsa.h"
+#include "mbedtls/ecp.h"
 #include "secrets.h"
 #include "dashboard_html.h"
+#include "blocklist_pubkey.h"
 
 // ---- config ----
 static const IPAddress UPSTREAM(9, 9, 9, 9);
 static const uint16_t DNS_PORT = 53;
 static const uint16_t DHCP_PORT = 67;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
+static const char* BLOCKLIST_SIG_PATH = "/blocklist.sig";  // DER ECDSA P-256 over the .bin
+static const size_t MAX_SIG_SIZE = 256;
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
 static const int DNS_BUF_SIZE = 1232;       // RFC 6891 max UDP DNS payload
@@ -61,7 +68,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.2";
+static const char* FIRMWARE_VERSION = "1.0.3";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -123,7 +130,7 @@ static void saveTxPowerCfg() {
 
 // ---- forward declarations ----
 WebServer web(80);
-static const char* COLLECTED_HEADERS[] = {"Authorization", "If-None-Match", "Origin", "Referer"};
+static const char* COLLECTED_HEADERS[] = {"Authorization", "If-None-Match", "Origin", "Referer", "X-CSRF-Token"};
 String updateUrl, updateStatus = "never";
 uint32_t updateIntervalH = 24, lastCheckMs = 0;
 static uint32_t lastDnsActivityMs = 0;
@@ -762,9 +769,25 @@ static bool checkAuth() {
   return web.header("Authorization") == expected;
 }
 static bool checkToken() {
-  return web.hasArg("token") && web.arg("token") == authToken;
+  // Header-only on purpose: a query-string token leaks into browser history,
+  // server logs and Referer headers. All dashboard JS sends X-CSRF-Token.
+  return web.header("X-CSRF-Token") == authToken;
 }
+static uint8_t authFails = 0;
+static uint32_t lastAuthFailMs = 0;
 static void requireAuth() {
+  // Tiny brute-force brake: 5 bad password attempts within 60 s -> 429 for a
+  // while. Browsers resend cached Basic credentials automatically, so legit
+  // polling doesn't trip this — only wrong-password guesses do.
+  uint32_t now = millis();
+  if ((now - lastAuthFailMs) > 60000UL) authFails = 0;
+  lastAuthFailMs = now;
+  if (authFails >= 5) {
+    web.sendHeader("Retry-After", "30");
+    web.send(429, "text/plain", "too many auth failures — retry later");
+    return;
+  }
+  authFails++;
   web.sendHeader("WWW-Authenticate", "Basic realm=\"C3 AdBlock\"");
   web.send(401, "text/plain", "auth required");
 }
@@ -789,6 +812,14 @@ static void handleRoot() {
   web.send_P(200, "text/html", PAGE);
 }
 
+// ---- blocklist signature state (verified in the signature section below) ----
+static bool blSigned = false;       // live blocklist verified against BL_PUBKEY?
+static bool requireSigned = false;  // when true, unsigned replacements are rejected
+static String swapStatus = "not run";
+static void loadSigReq();
+static void saveSigReq();
+static bool verifyBlocklistSig(const char* binPath, const char* sigPath);
+
 static void handleStats() {
   if (!checkAuth()) { requireAuth(); return; }
   uint32_t up = millis() / 1000;
@@ -808,6 +839,9 @@ static void handleStats() {
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
              ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"txpower\":\"" + txPowerSetting + "\"" +
+             ",\"blsig\":\"" + (blSigned ? "signed" : "unverified") + "\"" +
+             ",\"sigreq\":" + (requireSigned ? "true" : "false") +
+             ",\"keyid\":\"" + BL_KEY_ID + "\"" +
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) {
     Dev& c = clients[i]; IPAddress ip(c.ip);
@@ -871,6 +905,7 @@ static void handleDhcpToggle() {
 static void handleSetWifi() {
   if (!checkAuth()) { requireAuth(); return; }
   if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  if (web.method() != HTTP_POST) { web.send(405, "text/plain", "use POST"); return; }
   String ssid = web.arg("ssid");
   String pass = web.arg("pass");
   if (ssid.length() == 0) { web.send(400, "text/plain", "missing ssid"); return; }
@@ -878,6 +913,14 @@ static void handleSetWifi() {
   web.send(200, "text/plain", "saved — rebooting...");
   delay(500);
   ESP.restart();
+}
+
+static void handleSigRequire() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  requireSigned = !requireSigned;
+  saveSigReq();
+  web.send(200, "text/plain", requireSigned ? "signature required" : "signatures optional");
 }
 
 // ---- blocklist swap (shared by upload + remote fetch) ----
@@ -924,17 +967,83 @@ static void loadBloomFromBlocklist(File& f) {
   }
 }
 
+// ---- blocklist signature (ECDSA P-256, DER) ----
+// (blSigned / requireSigned / swapStatus + load/save/verify prototypes live
+// above handleStats; definitions of load/save/verify follow here.)
+
+static void loadSigReq() {
+  File f = LittleFS.open("/sigreq.cfg", "r");
+  if (!f) return;
+  String v = f.readStringUntil('\n'); v.trim();
+  requireSigned = (v == "1");
+  f.close();
+}
+static void saveSigReq() {
+  File f = LittleFS.open("/sigreq.cfg", "w");
+  if (!f) return;
+  f.println(requireSigned ? "1" : "0");
+  f.close();
+}
+
+// Stream SHA-256 over a LittleFS file (never loads the whole 700 KB into RAM).
+static bool sha256File(const char* path, uint8_t out[32]) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  static uint8_t chunk[2048];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  bool ok = (mbedtls_sha256_starts_ret(&ctx, 0) == 0);
+  while (ok && f.available()) {
+    size_t n = f.read(chunk, sizeof(chunk));
+    if (n == 0) break;
+    if (mbedtls_sha256_update_ret(&ctx, chunk, n) != 0) ok = false;
+  }
+  if (ok && mbedtls_sha256_finish_ret(&ctx, out) != 0) ok = false;
+  mbedtls_sha256_free(&ctx);
+  f.close();
+  return ok;
+}
+
+static bool verifyBlocklistSig(const char* binPath, const char* sigPath) {
+  File sf = LittleFS.open(sigPath, "r");
+  if (!sf) return false;
+  size_t slen = sf.size();
+  if (slen == 0 || slen > MAX_SIG_SIZE) { sf.close(); return false; }
+  uint8_t sig[MAX_SIG_SIZE];
+  size_t n = sf.read(sig, slen);
+  sf.close();
+  if (n != slen) return false;
+  uint8_t hash[32];
+  if (!sha256File(binPath, hash)) return false;
+  mbedtls_ecdsa_context ecdsa;
+  mbedtls_ecdsa_init(&ecdsa);
+  bool ok = false;
+  if (mbedtls_ecp_group_load(&ecdsa.grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+      mbedtls_ecp_point_read_binary(&ecdsa.grp, &ecdsa.Q, BL_PUBKEY, sizeof(BL_PUBKEY)) == 0 &&
+      mbedtls_ecp_check_pubkey(&ecdsa.grp, &ecdsa.Q) == 0 &&
+      mbedtls_ecdsa_read_signature(&ecdsa, hash, sizeof(hash), sig, slen) == 0) {
+    ok = true;
+  }
+  mbedtls_ecdsa_free(&ecdsa);
+  return ok;
+}
+
 static void reopenBlocklist() {
   if (blocklist) blocklist.close();
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   loadBloomFromBlocklist(blocklist);
-  if (blocklist) LOG("[bl] %u domains, bloom %u bits k=%u\n", numHashes, bloomBits, bloomK);
+  blSigned = blocklist && LittleFS.exists(BLOCKLIST_SIG_PATH) &&
+             verifyBlocklistSig(BLOCKLIST_PATH, BLOCKLIST_SIG_PATH);
+  if (blocklist) LOG("[bl] %u domains, bloom %u bits k=%u, %s\n",
+                     numHashes, bloomBits, bloomK, blSigned ? "signed" : "unverified");
 }
 static void beginBlocklistSwap() {
   // Keep serving the live blocklist while the replacement downloads/uploads.
-  // Only the staging file "/blocklist.new" is touched here; the live file is
-  // replaced atomically in commitNewBlocklist() after validation.
+  // Only the staging files "/blocklist.new" (+ optional ".new.sig") are
+  // touched here; the live files are replaced atomically in
+  // commitNewBlocklist() after validation.
   LittleFS.remove("/blocklist.new");
+  LittleFS.remove("/blocklist.new.sig");
 }
 static bool commitNewBlocklist() {
   File f = LittleFS.open("/blocklist.new", "r");
@@ -944,6 +1053,7 @@ static bool commitNewBlocklist() {
   // exact expected size, and at least one hash (reject empty/corrupt feeds
   // that would silently disable blocking).
   bool ok = false;
+  swapStatus = "bad data";
   if (sz >= BL_HEADER_SIZE) {
     File chk = LittleFS.open("/blocklist.new", "r");
     uint8_t hdr[BL_HEADER_SIZE];
@@ -953,18 +1063,47 @@ static bool commitNewBlocklist() {
         uint32_t bb = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
         size_t expected = BL_HEADER_SIZE + (bb + 7) / 8 + (size_t)nh * HASH_BYTES;
         if (sz == expected && nh > 0) ok = true;
-        else if (nh == 0) LOGN("[bl] rejecting empty blocklist");
+        else if (nh == 0) { LOGN("[bl] rejecting empty blocklist"); swapStatus = "empty blocklist"; }
+      } else {
+        LOGN("[bl] bad header");
       }
     }
     chk.close();
+  }
+  bool stagedSig = LittleFS.exists("/blocklist.new.sig");
+  bool sigOk = false;
+  if (ok) {
+    if (stagedSig) {
+      sigOk = verifyBlocklistSig("/blocklist.new", "/blocklist.new.sig");
+      if (!sigOk) {
+        LOGN("[bl] BAD signature — rejecting replacement");
+        swapStatus = "bad signature";
+        ok = false;
+      }
+    } else if (requireSigned) {
+      LOGN("[bl] signature required but missing — rejecting replacement");
+      swapStatus = "signature required";
+      ok = false;
+    }
   }
   if (ok) {
     if (blocklist) blocklist.close();
     LittleFS.remove(BLOCKLIST_PATH);
     LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-    reopenBlocklist();
+    if (stagedSig) {
+      LittleFS.remove(BLOCKLIST_SIG_PATH);
+      LittleFS.rename("/blocklist.new.sig", BLOCKLIST_SIG_PATH);
+    } else {
+      LittleFS.remove(BLOCKLIST_SIG_PATH);  // don't let a stale sig imply trust
+    }
+    blSigned = stagedSig && sigOk;
+    swapStatus = blSigned ? ("ok: " + String(numHashes) + " domains, signed (" + BL_KEY_ID + ")")
+                          : ("ok: " + String(numHashes) + " domains, UNVERIFIED");
+    reopenBlocklist();  // reloads hashes + re-verifies, sets blSigned authoritatively
+    swapStatus = "ok: " + String(numHashes) + " domains, " + (blSigned ? "signed" : "UNVERIFIED");
   } else {
     LittleFS.remove("/blocklist.new");
+    LittleFS.remove("/blocklist.new.sig");
     // Live blocklist was never touched — keep serving it. Reopen only if
     // somehow left closed (e.g. first boot with no live file).
     if (!blocklist) reopenBlocklist();
@@ -972,20 +1111,43 @@ static bool commitNewBlocklist() {
   return ok;
 }
 
-// ---- OTA blocklist update (browser upload) ----
+// ---- OTA blocklist update (browser upload: .bin + optional .sig) ----
 static bool upOk = false;
+static bool upGotBin = false;
 static File upFile;
+static bool upIsSig = false;
 static void handleUploadDone() {
+  bool doCommit = upGotBin;
+  upGotBin = false;  // consumed — a later request without a .bin must not commit
+  if (!doCommit) {
+    LittleFS.remove("/blocklist.new.sig");
+    web.send(upOk ? 200 : 400, "text/plain",
+             upOk ? "ok" : "rejected: upload the blocklist .bin (optional .sig alongside)");
+    return;
+  }
+  upOk = commitNewBlocklist();
+  LOG("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
   web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: invalid blocklist (bad magic/version/size)");
+           upOk ? ("ok: " + swapStatus) : ("rejected: " + swapStatus));
 }
 static void handleUpload() {
-  if (!checkAuth()) { requireAuth(); return; }
   HTTPUpload& u = web.upload();
+  // Auth is checked on every stage (headers persist for the whole request),
+  // but a response is only sent on START — answering mid-stream corrupts uploads.
+  if (!checkAuth()) { if (u.status == UPLOAD_FILE_START) requireAuth(); return; }
+  if (!checkToken()) { if (u.status == UPLOAD_FILE_START) web.send(403, "text/plain", "bad token"); return; }
   switch (u.status) {
     case UPLOAD_FILE_START:
-      upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
+      upOk = false;
+      upIsSig = u.filename.endsWith(".sig");
+      if (upFile) upFile.close();
+      if (upIsSig) {
+        upFile = LittleFS.open("/blocklist.new.sig", "w");
+      } else {
+        beginBlocklistSwap();  // fresh request: drop any previous staging
+        upGotBin = true;
+        upFile = LittleFS.open("/blocklist.new", "w");
+      }
       LOG("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
@@ -993,13 +1155,15 @@ static void handleUpload() {
       break;
     case UPLOAD_FILE_END:
       if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
-      LOG("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+      // Commit happens in handleUploadDone (after ALL files of the request).
+      LOG("[ota] got %s (%u bytes)\n", upIsSig ? "sig" : "bin", u.totalSize);
       break;
     case UPLOAD_FILE_ABORTED:
       if (upFile) upFile.close();
-      // Live blocklist was never touched — just drop the partial staging file.
+      // Live blocklist was never touched — just drop the partial staging files.
       LittleFS.remove("/blocklist.new");
+      LittleFS.remove("/blocklist.new.sig");
+      upGotBin = false;
       LOGN("[ota] aborted");
       break;
   }
@@ -1094,6 +1258,9 @@ static bool fetchBlocklist(String url) {
     if (!f) { http.end(); updateStatus = "fs open failed"; return false; }
     int written = http.writeToStream(&f);
     f.close();
+    // Best-effort companion signature (<final-url>.sig). Absent on servers
+    // that don't publish one — then the requireSigned policy decides.
+    String binUrl = currentUrl;
     http.end();
     if (written < 0) {
       updateStatus = "stream write failed (" + String(written) + ")";
@@ -1101,8 +1268,27 @@ static bool fetchBlocklist(String url) {
       LittleFS.remove("/blocklist.new");
       return false;
     }
+    {
+      WiFiClientSecure cs2;
+      cs2.setInsecure();  // same trust model as above; ECDSA verify is the real gate
+      HTTPClient sigHttp;
+      sigHttp.setTimeout(15000);
+      sigHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+      bool sigBegun = binUrl.startsWith("https") ? sigHttp.begin(cs2, binUrl + ".sig")
+                                                 : sigHttp.begin(binUrl + ".sig");
+      if (sigBegun && sigHttp.GET() == HTTP_CODE_OK) {
+        File sf = LittleFS.open("/blocklist.new.sig", "w");
+        if (sf) {
+          sigHttp.writeToStream(&sf);
+          sf.close();
+          if (LittleFS.open("/blocklist.new.sig", "r").size() == 0)
+            LittleFS.remove("/blocklist.new.sig");
+        }
+      }
+      sigHttp.end();
+    }
     bool ok = commitNewBlocklist();
-    updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(written) + "B)");
+    updateStatus = ok ? swapStatus : ("rejected: " + swapStatus);
     LOG("[remote] %s\n", updateStatus.c_str());
     return ok;
   }
@@ -1120,8 +1306,13 @@ static void handleFwUpdateDone() {
   if (ok) { delay(300); ESP.restart(); }
 }
 static void handleFwUpload() {
-  if (!checkAuth()) { requireAuth(); return; }
   HTTPUpload& u = web.upload();
+  // Upload endpoints previously had NO CSRF check (Basic Auth alone does not
+  // stop CSRF: the browser attaches cached credentials to a cross-origin form
+  // post). The token now travels in the X-CSRF-Token header, which a
+  // cross-origin page cannot set without a passing CORS preflight.
+  if (!checkAuth()) { if (u.status == UPLOAD_FILE_START) requireAuth(); return; }
+  if (!checkToken()) { if (u.status == UPLOAD_FILE_START) web.send(403, "text/plain", "bad token"); return; }
   if (u.status == UPLOAD_FILE_START) {
     LOG("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -1274,6 +1465,7 @@ void setup() {
   loadUpdateCfg();
   loadDhcpCfg();
   loadTxPowerCfg();
+  loadSigReq();
   reopenBlocklist();
   LOG("[cfg] custom:%d banned:%d auth:%s txpower:%s\n", numCustom, numBanned, authPassword.c_str(), txPowerSetting.c_str());
   LOGN("[cfg] dashboard password: " + authPassword);
@@ -1328,7 +1520,8 @@ void setup() {
     web.send(400, "text/plain", "invalid power level");
   });
   web.on("/dhcp", handleDhcpToggle);
-  web.on("/setwifi", handleSetWifi);
+  web.on("/setwifi", HTTP_POST, handleSetWifi);
+  web.on("/sigrequire", handleSigRequire);
   web.begin();
 
   ArduinoOTA.setHostname("c3adblock");

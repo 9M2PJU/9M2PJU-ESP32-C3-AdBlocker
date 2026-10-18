@@ -93,6 +93,9 @@ def main():
     ap.add_argument('--bloom-bits', type=int, default=DEFAULT_BLOOM_BITS,
                     help=f'Bloom filter size in bits (default: {DEFAULT_BLOOM_BITS} = 128 KB)')
     ap.add_argument('--no-bloom', action='store_true', help='skip Bloom filter')
+    ap.add_argument('--sign-key', default=None, metavar='PRIVKEY_PEM',
+                    help='also write OUT.sig: DER ECDSA P-256 signature over the .bin '
+                         '(verified by firmware against src/blocklist_pubkey.h)')
     args = ap.parse_args()
 
     sources = args.sources if args.sources else DEFAULT_SOURCES
@@ -176,6 +179,10 @@ def main():
     print(f'bloom filter     : {bloom_kb:.0f} KB, k={k}, FPR~{fpr:.1%}')
     print(f'flash blob       : {blob_size:,} bytes  ({blob_size/1024/1024:.2f} MB)  -> {args.out}')
     print(f'lookup           : ~{math.ceil(math.log2(max(num_hashes,2)))} flash reads/query (bloom miss = 0)')
+
+    if args.sign_key:
+        from sign_blocklist import sign_file
+        sign_file(args.out, args.sign_key)
 
 if __name__ == '__main__':
     main()

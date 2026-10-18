@@ -31,12 +31,29 @@ jobs:
         run: pio run
 
       - name: Run blocklist tests
-        run: python3 tools/test_build_blocklist.py
+        run: |
+          pip install cryptography
+          python3 tools/test_build_blocklist.py
 
       - name: Build default blocklist (StevenBlack + Hagezi Light, ~140k domains)
         run: |
           mkdir -p data
           python3 tools/build_blocklist.py data/blocklist.bin
+
+      - name: Sign blocklist (if signing key is configured)
+        env:
+          BLOCKLIST_SIGN_KEY: ${{ secrets.BLOCKLIST_SIGN_KEY }}
+        run: |
+          if [ -n "$BLOCKLIST_SIGN_KEY" ]; then
+            echo "$BLOCKLIST_SIGN_KEY" > /tmp/bl_signing.pem
+            chmod 600 /tmp/bl_signing.pem
+            python3 tools/sign_blocklist.py sign data/blocklist.bin /tmp/bl_signing.pem
+            rm -f /tmp/bl_signing.pem
+            cp data/blocklist.bin.sig data/blocklist.sig
+            ls -lh data/blocklist.bin.sig
+          else
+            echo "No BLOCKLIST_SIGN_KEY secret — publishing unsigned blocklist"
+          fi
 
       - name: Build filesystem image
         run: pio run -t buildfs
@@ -49,6 +66,7 @@ jobs:
           cp .pio/build/c3/partitions.bin release/partitions.bin
           cp .pio/build/c3/littlefs.bin release/blocklist-fs.bin
           cp data/blocklist.bin release/blocklist.bin
+          cp data/blocklist.bin.sig release/blocklist.bin.sig 2>/dev/null || true
           # Combined flashable image (bootloader + partitions + firmware + fs)
           # Offsets must match partitions.csv:
           #   bootloader: 0x0 (esptool default for C3)
@@ -73,5 +91,5 @@ jobs:
             release/bootloader.bin
             release/partitions.bin
             release/blocklist-fs.bin
-            release/blocklist.bin
+            release/blocklist.bin*
             release/full-flash.bin

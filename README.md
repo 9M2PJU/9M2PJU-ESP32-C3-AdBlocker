@@ -47,10 +47,20 @@ performance, and security fixes:
 
 ### Security
 - **Dashboard authentication** — Basic Auth with a random password generated on
-  first boot (printed on serial). Was: no auth, anyone on the LAN could flash
+  first boot (printed on serial), plus a brute-force brake (5 bad passwords in
+  60 s → HTTP 429 for a while). Was: no auth, anyone on the LAN could flash
   firmware or swap the blocklist.
-- **CSRF token** on all mutating endpoints — a malicious page on the LAN can't
-  ban clients or upload firmware via the victim's browser.
+- **CSRF token in a header** on all mutating endpoints — `X-CSRF-Token`, never in
+  the URL (no history/log/Referer leak). A malicious page on the LAN can't ban
+  clients, change WiFi, or upload firmware via the victim's browser — and the
+  firmware/software upload handlers now enforce the token too (they previously
+  relied on Basic Auth alone, which does not stop CSRF).
+- **Signed blocklist updates (ECDSA P-256)** — `tools/build_blocklist.py --sign-key`
+  writes `blocklist.bin.sig`; the firmware verifies it with mbedTLS against the
+  key in `src/blocklist_pubkey.h` before swapping. Bad signatures are rejected,
+  stale `.sig` files are never trusted, and the dashboard shows
+  signed/unverified (+ key id) with an optional "require-signed" enforcement
+  toggle. Remote fetch pulls `<url>.sig` automatically when published.
 - **HTTPS with redirect-following** for remote blocklist fetches (GitHub Releases
   & custom URLs). Note: certificate validation is *not* performed (`setInsecure`,
   no NTP/root store on the C3), so a LAN MITM could serve a well-formed but
@@ -75,7 +85,7 @@ performance, and security fixes:
 
 ### Code quality
 - **Dashboard HTML extracted** to `src/dashboard_html.h` (was inline in `main.cpp`).
-- **33 Python tests** for hashing, normalization, binary format, and Bloom filter
+- **37 Python tests** for hashing, normalization, binary format, Bloom filter, and ECDSA signatures
   correctness (`python3 tools/test_build_blocklist.py`).
 - **`LOG`/`LOGN` macros** — silence serial output with `-DNDEBUG`.
 - **Removed hardcoded `/dev/ttyACM0`** from `platformio.ini` — PlatformIO
@@ -250,6 +260,15 @@ You need [PlatformIO](https://platformio.org/) and Python 3.
    pio run -t upload
    pio run -t uploadfs
    ```
+   Signing your own blocklists (recommended if you publish a remote URL):
+   ```bash
+   # once: generate a keypair (privkey stays local + backed up, never committed)
+   python3 tools/sign_blocklist.py gen --priv tools/blocklist_signing.key --pub-h src/blocklist_pubkey.h
+   # per build: blocklist.bin + blocklist.bin.sig
+   python3 tools/build_blocklist.py data/blocklist.bin --sign-key tools/blocklist_signing.key
+   # remote fleet: publish both files; devices fetch blocklist.bin + blocklist.bin.sig
+   # CI releases: paste the privkey PEM into the BLOCKLIST_SIGN_KEY repo secret
+   ```
 
 6. **Continue to first-boot setup** below.
 
@@ -324,13 +343,17 @@ querying device appear in the **CLIENTS** table.
 
 The dashboard at **http://c3adblock.local** does it all:
 
-- **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
+- **Blocklist** — drop a freshly built `blocklist.bin` (+ optional `.sig` from
+  `--sign-key`) into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
-  on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
+  (+ `<url>.sig` when published) on a schedule (e.g. a GitHub release asset —
+  update it once, every device fetches it).
   Remote fetches support HTTPS with redirect-following (ideal for GitHub releases) and
   only *start* when DNS has been idle for 3+ seconds. Note: the download itself
   still pauses DNS for several seconds — schedule off-peak. Validation rejects
-  bad magic/size and empty lists, keeping the live list on any failure.
+  bad magic/size and empty lists, bad signatures, and (if enabled) unsigned
+  lists — keeping the live list on any failure. The dashboard shows whether the
+  live list is `signed` or `UNVERIFIED` and lets you toggle "require-signed".
 - **WiFi & Thermals** — change the WiFi network and configure WiFi TX power (from 2 dBm
   up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Lower TX power combined
   with automatic CPU idle yielding keeps the ESP32-C3 SuperMini cool (~35–45 °C) and
@@ -403,7 +426,7 @@ Collisions are reported to `blocklist.bin.collisions.txt` by the build script.
 ## Testing
 
 ```bash
-python3 tools/test_build_blocklist.py    # 33 tests: hashing, normalization, binary format, bloom
+python3 tools/test_build_blocklist.py    # 37 tests: hashing, normalization, binary format, bloom, signatures
 ```
 
 CI runs automatically on every push and PR via `.github/workflows/ci.yml` —
@@ -443,7 +466,7 @@ Releases with auto-generated release notes. Assets:
 - ✅ Dashboard auth (Basic Auth + CSRF token)
 - ✅ WiFiManager captive portal (first-boot WiFi setup without recompiling)
 - ✅ Optional DHCP server (hands out C3 as DNS for plug-and-play)
-- ✅ HTTPS with redirect following for remote blocklist fetches (GitHub Releases & custom URLs; no CA verification — bad/empty feeds rejected, live list kept)
+- ✅ HTTPS with redirect following + **ECDSA-signed** remote blocklist fetches (GitHub Releases & custom URLs; no CA verification — bad/empty/bad-signature feeds rejected, live list kept, optional require-signed)
 - ✅ Configurable WiFi TX power (2 to 19.5 dBm) & FreeRTOS idle sleep for cool PCB thermals
 - ✅ Browser Web Flasher via ESP Web Tools with correct ESP32-C3 bootloader offset 0x0
 - ✅ Blocklist v1 format with header validation

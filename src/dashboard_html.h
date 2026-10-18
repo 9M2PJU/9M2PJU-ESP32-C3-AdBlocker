@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.0.2</span>
+    <span class=badge id=fwver>v1.0.3</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -104,16 +104,19 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
       </div>
     </div>
     <div class=hint>Last update status: <span id=ustat style="color:#c9d1d9">&mdash;</span></div>
+    <div class=hint>Signature: <span id=sigst style="color:#c9d1d9">&mdash;</span>
+      <button onclick=toggleSigReq() style="margin-left:8px">Toggle require-signed</button></div>
 
     <hr class=div>
 
     <div style="font-weight:600;font-size:11px;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Manual Blocklist Upload</div>
     <form id=upf class="row row-full">
       <input type=file id=blf accept=.bin class=flex-1>
+      <input type=file id=sgf accept=.sig class=flex-1>
       <button>Upload blocklist</button>
       <span id=upmsg style=color:#8b949e></span>
     </form>
-    <div class=hint>Build <code>blocklist.bin</code> using <code>tools/build_blocklist.py</code> and upload directly without USB.</div>
+    <div class=hint>Build <code>blocklist.bin</code> using <code>tools/build_blocklist.py</code> (+ optional <code>--sign-key</code> for a <code>.sig</code>) and upload directly without USB.</div>
   </div>
 
   <div class=panel>
@@ -179,44 +182,47 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 let T='';
 function fmt(n){return n.toLocaleString()}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function mut(p){return p+(p.includes('?')?'&':'?')+'token='+T}
+function H(){return {'X-CSRF-Token':T}}
 async function load(){let s=await(await fetch('/stats.json')).json();
 T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.2'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
-['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off','']]
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.3'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
+['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
 `<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch(mut('/ban?ip=${encodeURIComponent(c.ip)}')).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch(mut('/unblock?d=${encodeURIComponent(d)}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+<td><button class=ban onclick="fetch('/ban?ip=${encodeURIComponent(c.ip)}',{headers:H()}).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch('/unblock?d=${encodeURIComponent(d)}',{headers:H()}).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';
+sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optional')+(s.keyid?' ('+s.keyid+')':''))||'—';
 dhcpst.textContent=s.dhcp?'ON':'OFF';
 dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
 wifi.textContent=s.wifi||'—';
 if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;}
-function addDom(){let d=dom.value.trim();if(d){fetch(mut('/addblock?d='+encodeURIComponent(d))).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch(mut('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24))).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch(mut('/fetchnow')).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-function toggleDhcp(){fetch(mut('/dhcp')).then(r=>r.text()).then(t=>{alert(t);load()})}
+function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
+function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
+function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
+function toggleDhcp(){fetch('/dhcp',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
+function toggleSigReq(){fetch('/sigrequire',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
 function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.textContent='enter SSID';return}
-wmsg.textContent='saving...';fetch(mut('/setwifi?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p))).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
-function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch(mut('/settxpower?p='+encodeURIComponent(p))).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
+wmsg.textContent='saving...';fetch('/setwifi',{method:'POST',headers:Object.assign({'Content-Type':'application/x-www-form-urlencoded'},H()),body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
+function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch('/settxpower?p='+encodeURIComponent(p),{headers:H()}).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch(mut('/update'),{method:'POST',body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
+try{let r=await fetch('/update',{method:'POST',headers:H(),body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
 catch(err){fwmsg.textContent='err: '+err.message;}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
-let fd=new FormData();fd.append('f',f);
-try{let r=await fetch(mut('/upload'),{method:'POST',body:fd});upmsg.textContent=r.ok?'updated':'failed: '+await r.text();}
+let fd=new FormData();fd.append('f',f);let g=sgf.files[0];if(g)fd.append('g',g);
+try{let r=await fetch('/upload',{method:'POST',headers:H(),body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
 catch(_){upmsg.textContent='upload failed';}
-blf.value='';setTimeout(load,600);};
+blf.value='';sgf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
 </script></body></html>)HTML";
 

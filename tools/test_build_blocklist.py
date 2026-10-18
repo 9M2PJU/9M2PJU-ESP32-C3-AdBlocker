@@ -138,9 +138,62 @@ check('ads.example.com hash in table', expected_hash in hashes)
 not_blocked = fnv40(b'google.com')
 check('google.com hash NOT in table', not_blocked not in hashes)
 
+# ---- Signature round-trip tests (ECDSA P-256, DER) ----
+print('\nSignature tests:')
+try:
+    from sign_blocklist import (gen_keypair, sign_file, verify_file,
+                                load_pubkey_pem)
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    import shutil
+
+    sig_tmp = tempfile.mkdtemp()
+    priv = os.path.join(sig_tmp, 'test_signing.key')
+    pubh = os.path.join(sig_tmp, 'pub.h')
+    gen_keypair(priv, pubh, key_id='test-keys')
+    check('signing keypair generated', os.path.exists(priv) and os.path.exists(pubh))
+
+    sig_path = sign_file(test_bin, priv)
+    pub_pem_path = os.path.join(sig_tmp, 'pub.pem')
+    with open(priv, 'rb') as f:
+        priv_key = serialization.load_pem_private_key(f.read(), password=None)
+    with open(pub_pem_path, 'wb') as f:
+        f.write(priv_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    check('valid signature verifies',
+          verify_file(test_bin, sig_path, load_pubkey_pem(pub_pem_path)))
+
+    # Tamper one hash byte -> must fail
+    with open(test_bin, 'r+b') as f:
+        f.seek(-1, 2)  # last byte of the file (inside the hash table)
+        b = f.read(1)
+        f.seek(-1, 2)
+        f.write(bytes([b[0] ^ 0xFF]))
+    check('tampered blocklist fails verification',
+          not verify_file(test_bin, sig_path, load_pubkey_pem(pub_pem_path)))
+
+    # Wrong key -> must fail
+    priv2 = os.path.join(sig_tmp, 'other.key')
+    pubh2 = os.path.join(sig_tmp, 'other.h')
+    gen_keypair(priv2, pubh2, key_id='other')
+    with open(priv2, 'rb') as f:
+        other_priv = serialization.load_pem_private_key(f.read(), password=None)
+    other_pem = os.path.join(sig_tmp, 'other_pub.pem')
+    with open(other_pem, 'wb') as f:
+        f.write(other_priv.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    check('wrong key fails verification',
+          not verify_file(test_bin, sig_path, load_pubkey_pem(other_pem)))
+    shutil.rmtree(sig_tmp, ignore_errors=True)
+except ImportError as e:
+    print(f'  SKIP: signer tests need the "cryptography" package ({e})')
+
 # ---- Cleanup ----
 os.unlink(test_bin)
 os.unlink(test_hosts)
+for extra in (test_bin + '.sig',):
+    if os.path.exists(extra):
+        os.unlink(extra)
 collisions_file = test_bin + '.collisions.txt'
 if os.path.exists(collisions_file):
     os.unlink(collisions_file)

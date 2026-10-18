@@ -29,7 +29,9 @@ jobs:
         run: pio run
 
       - name: Run blocklist tests
-        run: python3 tools/test_build_blocklist.py
+        run: |
+          pip install cryptography
+          python3 tools/test_build_blocklist.py
 
       - name: Build default blocklist
         run: |
