@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://buymeacoffee.com/9m2pju"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-9m2pju-orange?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me A Coffee"></a>
-  <a href="https://www.paypal.com/donate/?business=9m2pju@hamradio.my"><img src="https://img.shields.io/badge/Donate-PayPal-blue?style=for-the-badge&logo=paypal" alt="Donate with PayPal"></a>
+  <a href="https://paypal.me/9m2pju"><img src="https://img.shields.io/badge/Donate-PayPal-blue?style=for-the-badge&logo=paypal" alt="Donate with PayPal"></a>
 </p>
 
 A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** — *no PSRAM required*.
@@ -453,13 +453,13 @@ If you find this project useful and would like to support maintenance and develo
     <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48">
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://www.paypal.com/donate/?business=9m2pju@hamradio.my" target="_blank" rel="noopener">
+  <a href="https://paypal.me/9m2pju" target="_blank" rel="noopener">
     <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal">
   </a>
 </p>
 
 - **Buy Me a Coffee**: [buymeacoffee.com/9m2pju](https://buymeacoffee.com/9m2pju)
-- **PayPal**: [Donate via PayPal (9m2pju@hamradio.my)](https://www.paypal.com/donate/?business=9m2pju@hamradio.my)
+- **PayPal**: [paypal.me/9m2pju](https://paypal.me/9m2pju)
 
 ## Credits
 
