@@ -431,7 +431,9 @@ Releases with auto-generated release notes. Assets:
 - ✅ Dashboard auth (Basic Auth + CSRF token)
 - ✅ WiFiManager captive portal (first-boot WiFi setup without recompiling)
 - ✅ Optional DHCP server (hands out C3 as DNS for plug-and-play)
-- ✅ CA-verified HTTPS for remote blocklist fetches
+- ✅ HTTPS with redirect following for remote blocklist fetches (GitHub Releases & custom URLs)
+- ✅ Configurable WiFi TX power (2 to 19.5 dBm) & FreeRTOS idle sleep for cool PCB thermals
+- ✅ Browser Web Flasher via ESP Web Tools with correct ESP32-C3 bootloader offset 0x0
 - ✅ Blocklist v1 format with header validation
 - ⬜ Per-client blocking rules (different blocklists for different devices)
 - ⬜ Allowlist (override blocklist for specific domains)
