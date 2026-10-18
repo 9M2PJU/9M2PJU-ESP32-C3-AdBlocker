@@ -448,6 +448,16 @@ Releases with auto-generated release notes. Assets:
 
 If you find this project useful and would like to support maintenance and development:
 
+<p align="center">
+  <a href="https://buymeacoffee.com/9m2pju" target="_blank" rel="noopener">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="48">
+  </a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.paypal.com/donate/?business=9m2pju@hamradio.my" target="_blank" rel="noopener">
+    <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal">
+  </a>
+</p>
+
 - **Buy Me a Coffee**: [buymeacoffee.com/9m2pju](https://buymeacoffee.com/9m2pju)
 - **PayPal**: [Donate via PayPal (9m2pju@hamradio.my)](https://www.paypal.com/donate/?business=9m2pju@hamradio.my)
 
