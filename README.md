@@ -18,6 +18,18 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 
 ## What's new in this version
 
+### Recent releases
+- **v1.0.3** — **ECDSA-signed blocklist updates** (`--sign-key` → `.sig`, mbedTLS
+  verify on device, `<url>.sig` auto-fetch, dashboard signed/UNVERIFIED badge +
+  require-signed toggle); **CSRF token via `X-CSRF-Token` header only**
+  (incl. upload handlers, which had no CSRF check); `/setwifi` is POST-only;
+  brute-force brake (5 bad passwords/60 s → 429).
+- **v1.0.2** — fixed update-path data loss (live list kept until replacement
+  validates; empty feeds rejected), Bloom-malloc offset corruption, DHCP
+  (broadcast replies, octet pool, lease expiry), empty-device auto-heal, WiFi
+  reconnect, per-boot CSRF rotation, dashboard XSS escaping, plus honest
+  docs (no CA verification — signatures are the trust anchor).
+
 This is a heavily upgraded fork of the original `esp32-c3-adblock`. Every item from
 the original "how it could grow" list is done, plus a long list of correctness,
 performance, and security fixes:
@@ -453,6 +465,12 @@ Releases with auto-generated release notes. Assets:
 | `partitions.bin` | Partition table (rarely needed separately) |
 | `blocklist-fs.bin` | LittleFS image with the prebuilt blocklist |
 | `blocklist.bin` | Prebuilt blocklist (~140k domains) — for OTA blocklist updates |
+| `blocklist.bin.sig` | Detached ECDSA signature for `blocklist.bin` (when the release was built with the signing key) |
+
+Set the `BLOCKLIST_SIGN_KEY` repo secret (PEM of the private key matching
+`src/blocklist_pubkey.h`) and the release workflow signs the blocklist
+automatically; without it, releases ship unsigned and devices report them
+`UNVERIFIED` (still accepted unless require-signed is on).
 
 ## Done / how it could grow
 
