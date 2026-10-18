@@ -39,8 +39,9 @@ performance, and security fixes:
 - **Client table with LRU eviction** — was silently dropping stats past 96 clients.
 - **Banned IPs decoupled from the client table** — banning an IP with no active
   client entry now persists correctly.
-- **Idle-gated remote blocklist fetch** — only runs when DNS has been quiet 3+ s,
-  so a 20-second HTTPS download no longer freezes the household's DNS.
+- **Idle-gated remote blocklist fetch** — only *starts* when DNS has been quiet 3+ s,
+  so a scheduled pull doesn't kick off mid-stream. Note: the HTTPS download
+  itself still blocks DNS for several seconds while it runs — schedule off-peak.
 - **`millis()` wraparound-safe timing** — was broken every ~49 days of uptime.
 - **`parseQuery` robust bounds checking** — was fragile on compression pointers.
 
@@ -50,8 +51,12 @@ performance, and security fixes:
   firmware or swap the blocklist.
 - **CSRF token** on all mutating endpoints — a malicious page on the LAN can't
   ban clients or upload firmware via the victim's browser.
-- **CA-verified HTTPS** for remote blocklist fetches — was `setInsecure()`, which
-  let a MITM swap your blocklist for an empty one (silently disabling blocking).
+- **HTTPS with redirect-following** for remote blocklist fetches (GitHub Releases
+  & custom URLs). Note: certificate validation is *not* performed (`setInsecure`,
+  no NTP/root store on the C3), so a LAN MITM could serve a well-formed but
+  wrong list — the firmware rejects bad magic/size and empty lists and keeps
+  the live list on any failure. For high assurance, upload `blocklist.bin`
+  manually via the dashboard instead of remote pull.
 
 ### Features
 - **WiFiManager captive portal** — first-boot WiFi setup without recompiling.
@@ -323,7 +328,9 @@ The dashboard at **http://c3adblock.local** does it all:
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
   on a schedule (e.g. a GitHub release asset — update it once, every device fetches it).
   Remote fetches support HTTPS with redirect-following (ideal for GitHub releases) and
-  only run when DNS has been idle for 3+ seconds, so they don't interrupt service.
+  only *start* when DNS has been idle for 3+ seconds. Note: the download itself
+  still pauses DNS for several seconds — schedule off-peak. Validation rejects
+  bad magic/size and empty lists, keeping the live list on any failure.
 - **WiFi & Thermals** — change the WiFi network and configure WiFi TX power (from 2 dBm
   up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Lower TX power combined
   with automatic CPU idle yielding keeps the ESP32-C3 SuperMini cool (~35–45 °C) and
@@ -436,7 +443,7 @@ Releases with auto-generated release notes. Assets:
 - ✅ Dashboard auth (Basic Auth + CSRF token)
 - ✅ WiFiManager captive portal (first-boot WiFi setup without recompiling)
 - ✅ Optional DHCP server (hands out C3 as DNS for plug-and-play)
-- ✅ HTTPS with redirect following for remote blocklist fetches (GitHub Releases & custom URLs)
+- ✅ HTTPS with redirect following for remote blocklist fetches (GitHub Releases & custom URLs; no CA verification — bad/empty feeds rejected, live list kept)
 - ✅ Configurable WiFi TX power (2 to 19.5 dBm) & FreeRTOS idle sleep for cool PCB thermals
 - ✅ Browser Web Flasher via ESP Web Tools with correct ESP32-C3 bootloader offset 0x0
 - ✅ Blocklist v1 format with header validation

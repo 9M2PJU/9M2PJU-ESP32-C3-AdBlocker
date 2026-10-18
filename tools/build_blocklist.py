@@ -126,7 +126,7 @@ def main():
 
     uniq_hashes = sorted(hash_to_domains.keys())
     num_hashes = len(uniq_hashes)
-    collisions = num_hashes - len(uniq_hashes)  # always 0 since we dedup
+    num_collisions = len(domain_list) - num_hashes  # domains sharing a hash with another domain
     colliding_domains = []
     for h, doms in hash_to_domains.items():
         if len(doms) > 1:
@@ -166,7 +166,7 @@ def main():
 
     print(f'source domains   : {len(domains):,}')
     print(f'hash entries     : {num_hashes:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
-    print(f'collisions       : {len(colliding_domains)}  (domain pairs sharing a 40-bit hash -> over-block)')
+    print(f'collisions       : {len(colliding_domains)} groups, {num_collisions} extra domains sharing a 40-bit hash -> over-block')
     if colliding_domains:
         coll_path = args.out + '.collisions.txt'
         with open(coll_path, 'w') as cf:

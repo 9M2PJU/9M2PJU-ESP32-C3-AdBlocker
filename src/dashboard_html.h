@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.0.1</span>
+    <span class=badge id=fwver>v1.0.2</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -178,20 +178,21 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 </div><script>
 let T='';
 function fmt(n){return n.toLocaleString()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function mut(p){return p+(p.includes('?')?'&':'?')+'token='+T}
 async function load(){let s=await(await fetch('/stats.json')).json();
 T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.1'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.2'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
 ['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off','']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
 ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${c.ip}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${c.mac}</td>
+`<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
 <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch(mut('/ban?ip=${c.ip}')).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${d}</td><td style=text-align:right><button onclick="fetch(mut('/unblock?d='+encodeURIComponent('${d}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+<td><button class=ban onclick="fetch(mut('/ban?ip=${encodeURIComponent(c.ip)}')).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch(mut('/unblock?d=${encodeURIComponent(d)}')).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
 if(document.activeElement!=uurl)uurl.value=s.upurl||'';
 if(document.activeElement!=uiv)uiv.value=s.upiv||24;
 ustat.textContent=s.upstat||'—';

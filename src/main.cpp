@@ -14,8 +14,10 @@
 //  - Dashboard auth (Basic Auth + CSRF token)
 //  - Client table with LRU eviction
 //  - Decoupled ban storage (independent of client table)
-//  - Idle-gated remote blocklist fetch (doesn't freeze DNS)
-//  - CA-verified HTTPS for remote blocklist (no setInsecure)
+//  - Idle-gated remote blocklist fetch (deferred until DNS is quiet;
+//    the download itself still blocks DNS — schedule off-peak)
+//  - HTTPS with redirect-following for remote blocklist (no CA verification;
+//    bad/empty feeds rejected, live list kept on failure)
 //  - millis() wraparound-safe timing
 //  - Blocklist v1 format with header validation (magic + version + hash_bytes)
 //  - WiFiManager captive portal for first-boot WiFi config
@@ -59,8 +61,8 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.1";
-static const char* DASHBOARD_ETAG = "c3adb-v102";
+static const char* FIRMWARE_VERSION = "1.0.2";
+static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
 struct TxPowerOpt {
@@ -169,8 +171,8 @@ static bool inFlash(uint64_t h) {
   uint8_t b[HASH_BYTES];
   while (lo <= hi) {
     int32_t mid = (lo + hi) >> 1;
-    blocklist.seek(hashTableOffset + (uint32_t)mid * HASH_BYTES);
-    blocklist.read(b, HASH_BYTES);
+    if (!blocklist.seek(hashTableOffset + (uint32_t)mid * HASH_BYTES)) return false;
+    if (blocklist.read(b, HASH_BYTES) != HASH_BYTES) return false;
     uint64_t v = 0;
     for (int k = 0; k < HASH_BYTES; k++) v |= (uint64_t)b[k] << (8 * k);
     if (v < h) lo = mid + 1;
@@ -493,6 +495,10 @@ static int forwardUpstreamSync(uint8_t* pkt, int qlen) {
       }
       return 0;
     }
+    // Keep UDP DNS alive while waiting: drain one UDP query/reply per
+    // iteration instead of stalling the whole server for up to 2 s.
+    handleDns();
+    pollUpstream(dnsBuf, DNS_BUF_SIZE);
     delay(1);
   }
   return 0;
@@ -520,6 +526,9 @@ static bool handleTcpDns() {
       total += n;
     } else {
       if (millis() - t0 > UPSTREAM_TIMEOUT_MS) break;
+      // Don't stall UDP DNS while waiting for slow TCP sender.
+      handleDns();
+      pollUpstream(dnsBuf, DNS_BUF_SIZE);
       delay(1);
     }
   }
@@ -558,38 +567,66 @@ DhcpLease dhcpLeases[MAX_DHCP_LEASES];
 static uint32_t dhcpPoolStart = 0;
 static uint32_t dhcpPoolEnd = 0;
 
+// Pool addresses are kept in big-endian (network-order) integer form to match
+// the manual >>24 shifts used when building DHCP packets.
+static inline uint32_t ipToBE(const IPAddress& ip) {
+  return ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) | ((uint32_t)ip[2] << 8) | ip[3];
+}
+
 static void initDhcpPool() {
   IPAddress local = WiFi.localIP();
-  IPAddress gw = WiFi.gatewayIP();
-  // Pool: gateway + 100 to gateway + 200 (or local + 100..200 if no gateway)
-  uint32_t base = (uint32_t)gw;
-  if (base == 0) base = (uint32_t)local;
-  dhcpPoolStart = htonl(base) + 100;
-  dhcpPoolEnd = htonl(base) + 200;
+  // Pool: same /24 as our own address, .100 ... .200.
+  // Octet-based (no htonl tricks) so it can't spill into another subnet when
+  // the base address is high (e.g. .250 + 100 must NOT become x.x+1.x).
+  uint32_t net = ipToBE(local) & 0xFFFFFF00UL;
+  if (net == 0) net = (192UL << 24) | (168UL << 16) | (1UL << 8);  // fallback 192.168.1.x
+  dhcpPoolStart = net | 100;
+  dhcpPoolEnd = net | 200;
+}
+
+static inline bool dhcpExpired(uint32_t now, uint32_t expires) {
+  return (int32_t)(now - expires) >= 0;  // wraparound-safe
 }
 
 static uint32_t findDhcpLease(const uint8_t* mac) {
-  for (int i = 0; i < MAX_DHCP_LEASES; i++)
-    if (dhcpLeases[i].active && memcmp(dhcpLeases[i].mac, mac, 6) == 0)
+  uint32_t now = millis();
+  for (int i = 0; i < MAX_DHCP_LEASES; i++) {
+    if (dhcpLeases[i].active && memcmp(dhcpLeases[i].mac, mac, 6) == 0) {
+      if (dhcpExpired(now, dhcpLeases[i].expires)) {
+        dhcpLeases[i].active = false;  // reclaim stale lease
+        return 0;
+      }
       return dhcpLeases[i].ip;
+    }
+  }
   return 0;
 }
 static uint32_t assignDhcpIP(const uint8_t* mac) {
-  // Existing lease?
+  // Existing (unexpired) lease?
   uint32_t existing = findDhcpLease(mac);
   if (existing) return existing;
-  // Find free IP in pool
+  uint32_t now = millis();
+  uint32_t selfBE = ipToBE(WiFi.localIP());
+  uint32_t gwBE = ipToBE(WiFi.gatewayIP());
+  // Find free IP in pool (skip our own IP, the gateway, and .0/.255)
   for (uint32_t candidate = dhcpPoolStart; candidate <= dhcpPoolEnd; candidate++) {
+    uint8_t last = candidate & 0xFF;
+    if (last == 0 || last == 255) continue;
+    if (candidate == selfBE || candidate == gwBE) continue;
     bool taken = false;
-    for (int i = 0; i < MAX_DHCP_LEASES; i++)
-      if (dhcpLeases[i].active && dhcpLeases[i].ip == candidate) { taken = true; break; }
+    for (int i = 0; i < MAX_DHCP_LEASES; i++) {
+      if (dhcpLeases[i].active) {
+        if (dhcpExpired(now, dhcpLeases[i].expires)) dhcpLeases[i].active = false;
+        else if (dhcpLeases[i].ip == candidate) { taken = true; break; }
+      }
+    }
     if (!taken) {
       // Find free lease slot
       for (int i = 0; i < MAX_DHCP_LEASES; i++) {
         if (!dhcpLeases[i].active) {
           memcpy(dhcpLeases[i].mac, mac, 6);
           dhcpLeases[i].ip = candidate;
-          dhcpLeases[i].expires = millis() + 86400000UL;  // 24h
+          dhcpLeases[i].expires = now + 86400000UL;  // 24h
           dhcpLeases[i].active = true;
           return candidate;
         }
@@ -618,6 +655,7 @@ static bool handleDhcp() {
     if (opt == 0) continue;
     if (oi >= len) break;
     uint8_t optLen = dhcp[oi++];
+    if (oi + optLen > len) break;  // truncated option — stop parsing
     if (opt == 53 && optLen == 1) msgType = dhcp[oi];
     oi += optLen;
   }
@@ -658,7 +696,9 @@ static bool handleDhcp() {
   dhcp[o++] = 51; dhcp[o++] = 4; dhcp[o++] = 0; dhcp[o++] = 0; dhcp[o++] = 0x51; dhcp[o++] = 0x80;
   dhcp[o++] = 0xFF;  // end
 
-  dhcpSock.beginPacket(dhcpSock.remoteIP(), 68);
+  // DISCOVER/REQUEST come FROM 0.0.0.0 (client has no address yet), so a
+  // unicast reply to remoteIP would go nowhere. Broadcast the OFFER/ACK.
+  dhcpSock.beginPacket(IPAddress(255, 255, 255, 255), 68);
   dhcpSock.write(dhcp, o);
   dhcpSock.endPacket();
   return true;
@@ -684,12 +724,21 @@ static String b64encode(const String& s) {
   }
   return o;
 }
+static void genToken();
 static void genRandomPassword() {
   const char chars[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
   authPassword = "";
   for (int i = 0; i < 10; i++)
     authPassword += chars[esp_random() % (sizeof(chars) - 1)];
-  authToken = String((uint32_t)(esp_random() & 0xFFFFFF), HEX);
+  genToken();
+}
+static void genToken() {
+  // 64-bit CSRF token (16 hex chars). Regenerated every boot so a token
+  // leaked via browser history/logs is useless after a reboot.
+  uint32_t a = esp_random(), b = esp_random();
+  char t[17];
+  snprintf(t, sizeof(t), "%08x%08x", (unsigned)a, (unsigned)b);
+  authToken = String(t);
 }
 static void loadAuth() {
   File f = LittleFS.open("/auth.cfg", "r");
@@ -699,7 +748,11 @@ static void loadAuth() {
     f.close();
   }
   if (authPassword.length() == 0) {
-    genRandomPassword();
+    genRandomPassword();  // sets password + token
+  } else {
+    genToken();           // keep the password, rotate the token every boot
+  }
+  {
     File fo = LittleFS.open("/auth.cfg", "w");
     if (fo) { fo.println(authPassword); fo.println(authToken); fo.close(); }
   }
@@ -775,12 +828,14 @@ static void handleBan() {
   IPAddress ip;
   if (ip.fromString(web.arg("ip"))) {
     uint32_t ipraw = (uint32_t)ip;
-    Dev* c = getClient(ipraw);
-    if (c) {
-      c->banned = !c->banned;
-      if (c->banned) addBannedIP(ipraw); else removeBannedIP(ipraw);
-      saveBanned();
-    }
+    bool nowBanned;
+    if (isBannedIP(ipraw)) { removeBannedIP(ipraw); nowBanned = false; }
+    else { addBannedIP(ipraw); nowBanned = true; }
+    saveBanned();
+    // Reflect in the live client table if present, but don't create a new
+    // entry just to ban an unseen IP (that would waste client slots).
+    for (int i = 0; i < numClients; i++)
+      if (clients[i].ip == ipraw) { clients[i].banned = nowBanned; break; }
   }
   web.send(200, "text/plain", "ok");
 }
@@ -829,6 +884,8 @@ static void handleSetWifi() {
 static void loadBloomFromBlocklist(File& f) {
   if (bloomFilter) { free(bloomFilter); bloomFilter = nullptr; }
   bloomBits = 0; bloomK = 0;
+  numHashes = 0;
+  hashTableOffset = BL_HEADER_SIZE;
   if (!f) return;
   uint8_t hdr[BL_HEADER_SIZE];
   f.seek(0);
@@ -836,22 +893,34 @@ static void loadBloomFromBlocklist(File& f) {
   if (memcmp(hdr, BL_MAGIC, 4) != 0) { LOGN("[bl] bad magic"); return; }
   if (hdr[4] != BL_VERSION) { LOGN("[bl] wrong version"); return; }
   if (hdr[5] != HASH_BYTES) { LOGN("[bl] wrong hash_bytes"); return; }
-  numHashes = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
-  bloomBits = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
-  bloomK = hdr[14];
+  uint32_t nh = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
+  uint32_t bb = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
+  uint8_t k = hdr[14];
+  size_t bloomBytes = (bb + 7) / 8;
+  // Sanity-check sizes against the actual file before trusting the header.
+  size_t fsz = f.size();
+  if (fsz < BL_HEADER_SIZE + bloomBytes + (size_t)nh * HASH_BYTES) {
+    LOGN("[bl] truncated file — ignoring");
+    return;
+  }
+  numHashes = nh;
+  bloomBits = bb;
+  bloomK = k;
+  hashTableOffset = BL_HEADER_SIZE + bloomBytes;
   if (bloomBits > 0 && bloomK > 0) {
-    size_t bloomBytes = (bloomBits + 7) / 8;
     bloomFilter = (uint8_t*)malloc(bloomBytes);
     if (bloomFilter) {
-      f.read(bloomFilter, bloomBytes);
-      hashTableOffset = BL_HEADER_SIZE + bloomBytes;
+      if (f.read(bloomFilter, bloomBytes) != bloomBytes) {
+        LOGN("[bl] bloom short read — running without bloom");
+        free(bloomFilter); bloomFilter = nullptr;
+        bloomBits = 0; bloomK = 0;
+      }
     } else {
-      LOGN("[bl] bloom malloc failed — running without bloom");
+      LOGN("[bl] bloom malloc failed — running without bloom (lookups still correct)");
       bloomBits = 0; bloomK = 0;
-      hashTableOffset = BL_HEADER_SIZE;
     }
-  } else {
-    hashTableOffset = BL_HEADER_SIZE;
+    // NOTE: hashTableOffset always skips the on-disk bloom bytes,
+    // even when the RAM bloom is absent, so inFlash() stays aligned.
   }
 }
 
@@ -862,18 +931,18 @@ static void reopenBlocklist() {
   if (blocklist) LOG("[bl] %u domains, bloom %u bits k=%u\n", numHashes, bloomBits, bloomK);
 }
 static void beginBlocklistSwap() {
-  if (blocklist) blocklist.close();
-  numHashes = 0;
-  if (bloomFilter) { free(bloomFilter); bloomFilter = nullptr; }
-  bloomBits = 0; bloomK = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
+  // Keep serving the live blocklist while the replacement downloads/uploads.
+  // Only the staging file "/blocklist.new" is touched here; the live file is
+  // replaced atomically in commitNewBlocklist() after validation.
   LittleFS.remove("/blocklist.new");
 }
 static bool commitNewBlocklist() {
   File f = LittleFS.open("/blocklist.new", "r");
   size_t sz = f ? f.size() : 0;
   if (f) f.close();
-  // Validate: must have header with correct magic + version + hash_bytes
+  // Validate: must have header with correct magic + version + hash_bytes,
+  // exact expected size, and at least one hash (reject empty/corrupt feeds
+  // that would silently disable blocking).
   bool ok = false;
   if (sz >= BL_HEADER_SIZE) {
     File chk = LittleFS.open("/blocklist.new", "r");
@@ -883,14 +952,23 @@ static bool commitNewBlocklist() {
         uint32_t nh = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
         uint32_t bb = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
         size_t expected = BL_HEADER_SIZE + (bb + 7) / 8 + (size_t)nh * HASH_BYTES;
-        if (sz == expected) ok = true;
+        if (sz == expected && nh > 0) ok = true;
+        else if (nh == 0) LOGN("[bl] rejecting empty blocklist");
       }
     }
     chk.close();
   }
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
-  reopenBlocklist();
+  if (ok) {
+    if (blocklist) blocklist.close();
+    LittleFS.remove(BLOCKLIST_PATH);
+    LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
+    reopenBlocklist();
+  } else {
+    LittleFS.remove("/blocklist.new");
+    // Live blocklist was never touched — keep serving it. Reopen only if
+    // somehow left closed (e.g. first boot with no live file).
+    if (!blocklist) reopenBlocklist();
+  }
   return ok;
 }
 
@@ -920,7 +998,8 @@ static void handleUpload() {
       break;
     case UPLOAD_FILE_ABORTED:
       if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
+      // Live blocklist was never touched — just drop the partial staging file.
+      LittleFS.remove("/blocklist.new");
       LOGN("[ota] aborted");
       break;
   }
@@ -958,7 +1037,13 @@ static bool fetchBlocklist(String url) {
   for (int hop = 0; hop < maxHops; hop++) {
     LOG("[remote] hop %d GET %s\n", hop, currentUrl.c_str());
     WiFiClientSecure cs;
-    cs.setInsecure();  // Accept arbitrary HTTPS hosts without local root CA store or NTP time sync
+    // NOTE: no CA verification (setInsecure). The C3 has no system clock/DST
+    // root store for full chain validation without NTP + bundled roots, so a
+    // LAN MITM could serve a well-formed-but-wrong blocklist. Mitigations:
+    // commitNewBlocklist() rejects bad magic/size and empty lists, and the
+    // live list is kept on any failure. For high assurance, upload
+    // blocklist.bin manually via the dashboard instead of remote pull.
+    cs.setInsecure();
     WiFiClient cl;
     HTTPClient http;
     http.setTimeout(25000);
@@ -984,8 +1069,15 @@ static bool fetchBlocklist(String url) {
         int slashIdx = currentUrl.indexOf('/', currentUrl.indexOf("://") + 3);
         if (slashIdx > 0) currentUrl = currentUrl.substring(0, slashIdx) + loc;
         else currentUrl = currentUrl + loc;
+      } else if (loc.indexOf("://") > 0) {
+        currentUrl = loc;  // absolute URL
       } else {
-        currentUrl = loc;
+        // Relative reference ("other.bin"): resolve against the current path.
+        int lastSlash = currentUrl.lastIndexOf('/');
+        if (lastSlash > currentUrl.indexOf("://") + 2)
+          currentUrl = currentUrl.substring(0, lastSlash + 1) + loc;
+        else
+          currentUrl = currentUrl + "/" + loc;
       }
       continue;
     }
@@ -999,14 +1091,14 @@ static bool fetchBlocklist(String url) {
 
     beginBlocklistSwap();
     File f = LittleFS.open("/blocklist.new", "w");
-    if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+    if (!f) { http.end(); updateStatus = "fs open failed"; return false; }
     int written = http.writeToStream(&f);
     f.close();
     http.end();
     if (written < 0) {
       updateStatus = "stream write failed (" + String(written) + ")";
       LOG("[remote] %s\n", updateStatus.c_str());
-      reopenBlocklist();
+      LittleFS.remove("/blocklist.new");
       return false;
     }
     bool ok = commitNewBlocklist();
@@ -1111,6 +1203,12 @@ static void handleCaptiveDns() {
     captiveDns.beginPacket(cip, cport);
     captiveDns.write(dnsBuf, qend + sizeof(ans));
     captiveDns.endPacket();
+  } else if (qtype == 28) {
+    // AAAA: portal is IPv4-only — send NODATA (NOERROR, no answers) so
+    // clients fail over to IPv4 immediately instead of timing out.
+    captiveDns.beginPacket(cip, cport);
+    captiveDns.write(dnsBuf, qend);
+    captiveDns.endPacket();
   }
 }
 
@@ -1121,7 +1219,14 @@ static void runCaptivePortal() {
   LOGN("\n[captive] AP: C3AdBlock-Setup — connect and open http://192.168.4.1");
   captiveDns.begin(53);
   web.on("/", []() { web.send(200, "text/html", PORTAL_HTML); });
-  web.on("/generate_204", []() { web.send(204); });  // Android captive detection
+  auto portalRedirect = []() { web.sendHeader("Location", "http://192.168.4.1/", true); web.send(302, "text/plain", ""); };
+  web.on("/generate_204", []() { web.send(204); });  // Android
+  web.on("/connecttest.txt", portalRedirect);        // Windows
+  web.on("/redirect", portalRedirect);               // Windows
+  web.on("/ncsi.txt", portalRedirect);               // Windows
+  web.on("/hotspot-detect.html", portalRedirect);    // iOS / macOS
+  web.on("/library/test/success.html", portalRedirect);  // iOS
+  web.onNotFound([]() { web.send(200, "text/html", PORTAL_HTML); });
   web.on("/save-wifi", HTTP_POST, []() {
     String ssid = web.arg("ssid");
     String pass = web.arg("pass");
@@ -1248,15 +1353,33 @@ void loop() {
   if (handleTcpDns()) busy = true;
   if (dhcpEnabled && handleDhcp()) busy = true;
 
+  // Reconnect WiFi if the AP/router rebooted (connectWiFi() only ran at boot).
+  // Throttled so a down network doesn't busy-loop; DNS is broken while
+  // offline anyway, so a blocking 15 s retry here is acceptable.
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t lastRetryMs = 0;
+    uint32_t nowW = millis();
+    if (nowW - lastRetryMs >= 10000UL) {
+      lastRetryMs = nowW;
+      busy = true;
+      if (connectWiFi() && dhcpEnabled) initDhcpPool();  // IP may have changed
+    }
+  }
+
   // Track DNS activity for idle-gated remote fetch (set in handleDns/pollUpstream)
   if (pendingCount > 0) lastDnsActivityMs = millis();
 
-  // Idle-gated remote blocklist auto-update (only when DNS has been quiet)
-  if (updateUrl.length() && numHashes > 0) {
+  // Idle-gated remote blocklist auto-update (only when DNS has been quiet).
+  // NOTE: the fetch itself still blocks DNS for several seconds while the
+  // HTTPS download runs — gating only defers the start. Schedule off-peak.
+  // An empty blocklist retries every 60 s so a fresh device self-heals.
+  if (updateUrl.length()) {
     uint32_t now = millis();
+    uint32_t intervalMs = (numHashes == 0) ? 60000UL : updateIntervalH * 3600000UL;
     if (lastCheckMs == 0) {
-      lastCheckMs = now;  // skip immediate fetch on boot
-    } else if ((now - lastCheckMs) >= updateIntervalH * 3600000UL &&
+      // Boot: fetch soon when empty, otherwise wait a full interval.
+      lastCheckMs = (numHashes == 0) ? (now - intervalMs) : now;
+    } else if ((now - lastCheckMs) >= intervalMs &&
                (now - lastDnsActivityMs) >= REMOTE_FETCH_IDLE_MS) {
       lastCheckMs = now;
       fetchBlocklist(updateUrl);
