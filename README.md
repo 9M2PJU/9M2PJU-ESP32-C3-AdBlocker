@@ -19,6 +19,8 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.6** — maintenance version bump only, no functional changes (keeps
+  firmware version + web flasher manifest in sync).
 - **v1.0.5** — fixed GitHub Releases blocklist fetch: `.sig` is now fetched
   next to the *original* URL (not the signed `release-assets` redirect URL
   with `?sp=r&sig=...` query, which always 404'd) **and** follows redirects
