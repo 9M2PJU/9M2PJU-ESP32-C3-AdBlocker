@@ -68,7 +68,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.6";
+static const char* FIRMWARE_VERSION = "1.0.7";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -1173,6 +1173,13 @@ static void handleUpload() {
 
 static const char* DEFAULT_UPDATE_URL = "https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin";
 
+static void normalizeUpdateUrl(String &u) {
+  u.trim();
+  // Dashboard placeholder shows a bare host/path; a missing scheme would
+  // otherwise be fetched as plain HTTP on port 80. GitHub Pages only serves
+  // HTTPS properly, so assume https when no scheme is present.
+  if (u.length() && u.indexOf("://") < 0) u = "https://" + u;
+}
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r");
   if (!f) {
@@ -1184,6 +1191,7 @@ static void loadUpdateCfg() {
   if (iv.length()) updateIntervalH = iv.toInt();
   f.close();
   if (!updateUrl.length()) updateUrl = DEFAULT_UPDATE_URL;
+  normalizeUpdateUrl(updateUrl);
   if (updateIntervalH < 1) updateIntervalH = 1;
 }
 static void saveUpdateCfg() {
@@ -1255,6 +1263,7 @@ static String fwUserAgent() {
 static bool fetchBlocklist(String url) {
   url.trim();
   if (!url.length()) url = DEFAULT_UPDATE_URL;
+  normalizeUpdateUrl(url);
   if (WiFi.status() != WL_CONNECTED) {
     updateStatus = "wifi not connected [" + netDiag() + "]";
     LOG("[remote] %s\n", updateStatus.c_str());
@@ -1303,17 +1312,48 @@ static bool fetchBlocklist(String url) {
     WiFiClient cl;
     HTTPClient http;
     http.setTimeout(60000);  // 700 KB over slow WiFi + LittleFS writes needs >25 s
+    http.setConnectTimeout(15000);  // fail fast instead of stalling DNS on a dead peer
     http.setReuse(false);    // free the socket immediately (redirect + .sig hops)
     http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.collectHeaders(headerKeys, 1);
     http.setUserAgent(fwUserAgent());
 
     bool https = currentUrl.startsWith("https");
-    if (!(https ? http.begin(cs, currentUrl) : http.begin(cl, currentUrl))) {
-      updateStatus = "begin failed [" + netDiag() + "]"; return false;
+    // Two attempts per hop: the C3's first TLS handshake often fails
+    // transiently (weak RSSI, Fastly RST, low-heap handshake alloc), while
+    // the second one on a warm radio succeeds. http.begin/end cycles on the
+    // same client object are supported, so just re-run it after a pause.
+    int code = -1;
+    char tlsErr[96] = {0};
+    int tlsCode = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) {
+        cs.stop(); cl.stop();
+        delay(1500);
+        LOG("[remote] hop %d retry (%s)\n", hop, netDiag().c_str());
+      }
+      if (!(https ? http.begin(cs, currentUrl) : http.begin(cl, currentUrl))) {
+        http.end();
+        if (attempt == 0) continue;  // retry once before giving up
+        updateStatus = "begin failed [" + netDiag() + "]"; return false;
+      }
+      code = http.GET();
+      if (code >= 0) break;
+      if (https) tlsCode = cs.lastError(tlsErr, sizeof(tlsErr));
+      LOG("[remote] hop %d attempt %d failed: HTTP %s%s%s [%s] (heap %u)\n",
+          hop, attempt, httpErrStr(code).c_str(),
+          tlsCode ? " tls: " : "", tlsCode ? tlsErr : "",
+          netDiag().c_str(), (unsigned)ESP.getFreeHeap());
+      http.end();
     }
-
-    int code = http.GET();
+    if (code < 0) {
+      String detail = "HTTP " + httpErrStr(code);
+      if (tlsCode && tlsErr[0]) detail += " tls:" + String(tlsErr);
+      detail += " [" + netDiag() + "]";
+      updateStatus = detail;
+      LOG("[remote] %s\n", updateStatus.c_str());
+      return false;
+    }
     if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
         code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT || code == 308) {
       String loc = http.header("Location");
@@ -1373,6 +1413,7 @@ static bool fetchBlocklist(String url) {
           WiFiClient cl2;
           HTTPClient sigHttp;
           sigHttp.setTimeout(30000);
+          sigHttp.setConnectTimeout(15000);
           sigHttp.setReuse(false);
           sigHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
           sigHttp.collectHeaders(headerKeys, 1);
@@ -1627,7 +1668,7 @@ void setup() {
   web.on("/setupdate", []() {
     if (!checkAuth()) { requireAuth(); return; }
     if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
-    if (web.hasArg("u")) updateUrl = web.arg("u");
+    if (web.hasArg("u")) { updateUrl = web.arg("u"); normalizeUpdateUrl(updateUrl); }
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg();
     web.send(200, "text/plain", "ok");

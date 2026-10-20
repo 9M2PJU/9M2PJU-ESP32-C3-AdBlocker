@@ -1,5 +1,5 @@
 name: 9M2PJU ESP32-C3 AdBlocker
-version: "1.0.6"
+version: "1.0.7"
 new_install_prompt_erase: true
 builds:
   - name: esp32-c3

@@ -19,6 +19,14 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.7** — fixed remote auto-update `HTTP -1` on the GitHub Pages URL:
+  bare host/path without a scheme now gets `https://` prepended (dashboard JS
+  + firmware), each hop is retried once after a pause (first C3 TLS handshake
+  often fails transiently on weak RSSI/low heap), failures report the
+  mbedTLS handshake error + heap instead of a bare "connection refused", and
+  connect timeout is capped at 15 s; new `sync-pages` workflow keeps the fixed
+  Pages URL fresh (rebuild + overwrite `docs/blocklist.bin` on release,
+  weekly, or manual dispatch — bin/`.sig` always in sync).
 - **v1.0.6** — maintenance version bump only, no functional changes (keeps
   firmware version + web flasher manifest in sync).
 - **v1.0.5** — fixed GitHub Releases blocklist fetch: `.sig` is now fetched
@@ -373,7 +381,8 @@ The dashboard at **http://c3adblock.local** does it all:
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`
   (+ `<url>.sig` when published) on a schedule. Good URLs:
   `https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin` (GitHub
-  Pages — fastest on the C3, no redirect) or
+  Pages — fastest on the C3, no redirect; auto-refreshed weekly + on every
+  release by the `sync-pages` workflow) or
   `https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker/releases/latest/download/blocklist.bin`
   (follows the `github.com → release-assets` redirect chain, `.sig` too).
   Do **not** use `raw.githubusercontent.com/.../releases/...` — raw only serves

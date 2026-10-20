@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.0.6</span>
+    <span class=badge id=fwver>v1.0.7</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -188,7 +188,7 @@ T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.6'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.7'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
 ['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
 ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
@@ -206,7 +206,7 @@ dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
 wifi.textContent=s.wifi||'—';
 if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
-function saveUpd(){fetch('/setupdate?u='+encodeURIComponent(uurl.value.trim())+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
+function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
 function toggleDhcp(){fetch('/dhcp',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
 function toggleSigReq(){fetch('/sigrequire',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}

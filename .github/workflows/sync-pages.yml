@@ -1,0 +1,98 @@
+name: Sync Pages blocklist
+
+# Keeps the fixed remote auto-update URL fresh:
+#   https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/blocklist.bin
+# GitHub Pages serves whatever is committed under docs/, so this workflow
+# rebuilds the blocklist (same default sources as releases) and overwrites
+# docs/blocklist.bin (+ docs/blocklist.bin.sig) on:
+#   - every published release (Pages matches the release snapshot), and
+#   - a weekly schedule (lists drift daily; devices poll on their own interval),
+#   - manual dispatch (Actions tab -> "Run workflow").
+#
+# Bin/sig are always kept in sync: an unsigned build DELETES the stale .sig
+# (otherwise devices would fetch a signature for different bytes and reject
+# the update as "bad signature"). Unsigned Pages builds are accepted as
+# UNVERIFIED unless the device toggled require-signed.
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: '0 3 * * 1'  # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build blocklist (same default sources as releases)
+        run: |
+          pip install cryptography
+          mkdir -p data
+          python3 tools/build_blocklist.py /tmp/new-blocklist.bin
+          ls -lh /tmp/new-blocklist.bin
+
+      - name: Sign blocklist (if signing key is configured)
+        env:
+          BLOCKLIST_SIGN_KEY: ${{ secrets.BLOCKLIST_SIGN_KEY }}
+        run: |
+          rm -f /tmp/new-blocklist.bin.sig
+          if [ -n "$BLOCKLIST_SIGN_KEY" ]; then
+            echo "$BLOCKLIST_SIGN_KEY" > /tmp/bl_signing.pem
+            chmod 600 /tmp/bl_signing.pem
+            python3 tools/sign_blocklist.py sign /tmp/new-blocklist.bin /tmp/bl_signing.pem --out /tmp/new-blocklist.bin.sig
+            rm -f /tmp/bl_signing.pem
+            ls -lh /tmp/new-blocklist.bin.sig
+          else
+            echo "No BLOCKLIST_SIGN_KEY secret — publishing unsigned blocklist"
+          fi
+
+      - name: Overwrite Pages files and push if changed
+        run: |
+          changed=0
+          if ! cmp -s /tmp/new-blocklist.bin docs/blocklist.bin; then
+            cp /tmp/new-blocklist.bin docs/blocklist.bin
+            changed=1
+          fi
+          if [ -f /tmp/new-blocklist.bin.sig ]; then
+            if ! cmp -s /tmp/new-blocklist.bin.sig docs/blocklist.bin.sig 2>/dev/null; then
+              cp /tmp/new-blocklist.bin.sig docs/blocklist.bin.sig
+              changed=1
+            fi
+          else
+            # Unsigned build must not leave a stale .sig behind: it belongs to
+            # different bytes and devices would reject the update as "bad
+            # signature" instead of accepting it as UNVERIFIED.
+            if [ -f docs/blocklist.bin.sig ]; then
+              rm -f docs/blocklist.bin.sig
+              changed=1
+            fi
+          fi
+          if [ "$changed" = "0" ]; then
+            echo "Pages blocklist already up to date — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/blocklist.bin
+          if [ -f docs/blocklist.bin.sig ]; then
+            git add docs/blocklist.bin.sig
+          else
+            # Stage the deletion when an unsigned build removes a previously
+            # signed .sig; ignore when it never existed.
+            git rm --cached -q docs/blocklist.bin.sig 2>/dev/null || true
+          fi
+          git commit -m "Sync Pages blocklist ($(date -u +%Y-%m-%d)) [skip ci]"
+          git push origin HEAD:main
