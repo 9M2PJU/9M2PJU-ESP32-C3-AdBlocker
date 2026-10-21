@@ -19,6 +19,11 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.8** — fixed release build on the latest PlatformIO `espressif32`
+  toolchain (mbedTLS 3.x): SHA-256 now uses the version-appropriate API and
+  blocklist ECDSA verification no longer touches opaque `ecdsa_context`
+  internals (portable `grp` + `Q` + `r/s` + `mbedtls_ecdsa_verify`), so the
+  build compiles on both mbedTLS 2.x and 3.x.
 - **v1.0.7** — fixed remote auto-update `HTTP -1` on the GitHub Pages URL:
   bare host/path without a scheme now gets `https://` prepended (dashboard JS
   + firmware), each hop is retried once after a pause (first C3 TLS handshake

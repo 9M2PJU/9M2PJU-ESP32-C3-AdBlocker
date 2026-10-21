@@ -47,6 +47,8 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/ecp.h"
+#include "mbedtls/bignum.h"
+#include "mbedtls/version.h"
 #include "secrets.h"
 #include "dashboard_html.h"
 #include "blocklist_pubkey.h"
@@ -68,7 +70,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.0.7";
+static const char* FIRMWARE_VERSION = "1.0.8";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -986,12 +988,23 @@ static void saveSigReq() {
 }
 
 // Stream SHA-256 over a LittleFS file (never loads the whole 700 KB into RAM).
+// mbedtls 2.x uses *_ret (int), 3.x uses non-_ret (int); the old non-_ret
+// void wrappers exist only on 2.x. Branch on the version number.
 static bool sha256File(const char* path, uint8_t out[32]) {
   File f = LittleFS.open(path, "r");
   if (!f) return false;
   static uint8_t chunk[2048];
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+  bool ok = (mbedtls_sha256_starts(&ctx, 0) == 0);
+  while (ok && f.available()) {
+    size_t n = f.read(chunk, sizeof(chunk));
+    if (n == 0) break;
+    if (mbedtls_sha256_update(&ctx, chunk, n) != 0) ok = false;
+  }
+  if (ok && mbedtls_sha256_finish(&ctx, out) != 0) ok = false;
+#else
   bool ok = (mbedtls_sha256_starts_ret(&ctx, 0) == 0);
   while (ok && f.available()) {
     size_t n = f.read(chunk, sizeof(chunk));
@@ -999,9 +1012,41 @@ static bool sha256File(const char* path, uint8_t out[32]) {
     if (mbedtls_sha256_update_ret(&ctx, chunk, n) != 0) ok = false;
   }
   if (ok && mbedtls_sha256_finish_ret(&ctx, out) != 0) ok = false;
+#endif
   mbedtls_sha256_free(&ctx);
   f.close();
   return ok;
+}
+
+// Minimal DER ECDSA-signature parser (SEQUENCE { INTEGER r, INTEGER s }).
+// Avoids mbedtls_ecdsa_context internals, which became opaque in mbedtls 3.x.
+static bool parseDerSig(const uint8_t* sig, size_t slen, mbedtls_mpi* r, mbedtls_mpi* s) {
+  if (slen < 8 || sig[0] != 0x30) return false;
+  size_t pos = 1;
+  size_t seqLen = sig[pos++];
+  if (seqLen & 0x80) {
+    size_t nLen = seqLen & 0x7f;
+    if (nLen == 0 || nLen > 2 || pos + nLen > slen) return false;
+    seqLen = 0;
+    for (size_t i = 0; i < nLen; i++) seqLen = (seqLen << 8) | sig[pos++];
+  }
+  if (pos + seqLen != slen) return false;
+  if (pos >= slen || sig[pos++] != 0x02) return false;
+  if (pos >= slen) return false;
+  size_t rLen = sig[pos++];
+  if (rLen == 0 || pos + rLen > slen) return false;
+  const uint8_t* rBuf = sig + pos;
+  pos += rLen;
+  if (pos >= slen || sig[pos++] != 0x02) return false;
+  if (pos >= slen) return false;
+  size_t sLen = sig[pos++];
+  if (sLen == 0 || pos + sLen > slen) return false;
+  const uint8_t* sBuf = sig + pos;
+  pos += sLen;
+  if (pos != slen) return false;
+  if (mbedtls_mpi_read_binary(r, rBuf, rLen) != 0) return false;
+  if (mbedtls_mpi_read_binary(s, sBuf, sLen) != 0) return false;
+  return true;
 }
 
 static bool verifyBlocklistSig(const char* binPath, const char* sigPath) {
@@ -1015,16 +1060,25 @@ static bool verifyBlocklistSig(const char* binPath, const char* sigPath) {
   if (n != slen) return false;
   uint8_t hash[32];
   if (!sha256File(binPath, hash)) return false;
-  mbedtls_ecdsa_context ecdsa;
-  mbedtls_ecdsa_init(&ecdsa);
+  mbedtls_ecp_group grp;
+  mbedtls_ecp_point Q;
+  mbedtls_mpi r, s;
+  mbedtls_ecp_group_init(&grp);
+  mbedtls_ecp_point_init(&Q);
+  mbedtls_mpi_init(&r);
+  mbedtls_mpi_init(&s);
   bool ok = false;
-  if (mbedtls_ecp_group_load(&ecdsa.grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
-      mbedtls_ecp_point_read_binary(&ecdsa.grp, &ecdsa.Q, BL_PUBKEY, sizeof(BL_PUBKEY)) == 0 &&
-      mbedtls_ecp_check_pubkey(&ecdsa.grp, &ecdsa.Q) == 0 &&
-      mbedtls_ecdsa_read_signature(&ecdsa, hash, sizeof(hash), sig, slen) == 0) {
+  if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1) == 0 &&
+      mbedtls_ecp_point_read_binary(&grp, &Q, BL_PUBKEY, sizeof(BL_PUBKEY)) == 0 &&
+      mbedtls_ecp_check_pubkey(&grp, &Q) == 0 &&
+      parseDerSig(sig, slen, &r, &s) &&
+      mbedtls_ecdsa_verify(&grp, hash, sizeof(hash), &Q, &r, &s) == 0) {
     ok = true;
   }
-  mbedtls_ecdsa_free(&ecdsa);
+  mbedtls_ecp_group_free(&grp);
+  mbedtls_ecp_point_free(&Q);
+  mbedtls_mpi_free(&r);
+  mbedtls_mpi_free(&s);
   return ok;
 }
 
@@ -1034,8 +1088,8 @@ static void reopenBlocklist() {
   loadBloomFromBlocklist(blocklist);
   blSigned = blocklist && LittleFS.exists(BLOCKLIST_SIG_PATH) &&
              verifyBlocklistSig(BLOCKLIST_PATH, BLOCKLIST_SIG_PATH);
-  if (blocklist) LOG("[bl] %u domains, bloom %u bits k=%u, %s\n",
-                     numHashes, bloomBits, bloomK, blSigned ? "signed" : "unverified");
+  if (blocklist) LOG("[bl] %lu domains, bloom %lu bits k=%lu, %s\n",
+                     (unsigned long)numHashes, (unsigned long)bloomBits, (unsigned long)bloomK, blSigned ? "signed" : "unverified");
 }
 static void beginBlocklistSwap() {
   // Keep serving the live blocklist while the replacement downloads/uploads.
@@ -1126,7 +1180,7 @@ static void handleUploadDone() {
     return;
   }
   upOk = commitNewBlocklist();
-  LOG("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+  LOG("[ota] %s -> %lu domains\n", upOk ? "OK" : "REJECTED", (unsigned long)numHashes);
   web.send(upOk ? 200 : 500, "text/plain",
            upOk ? ("ok: " + swapStatus) : ("rejected: " + swapStatus));
 }
