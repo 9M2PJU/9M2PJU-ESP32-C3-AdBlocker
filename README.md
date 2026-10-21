@@ -19,6 +19,9 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.0.9** — pinned PlatformIO `espressif32@7.1.3`: the floating platform
+  had moved to 8.x (Arduino core 3.x), whose firmware (~1.42 MB) overflows
+  the 0x150000 app slot; the pinned toolchain builds at ~1.06 MB.
 - **v1.0.8** — fixed release build on the latest PlatformIO `espressif32`
   toolchain (mbedTLS 3.x): SHA-256 now uses the version-appropriate API and
   blocklist ECDSA verification no longer touches opaque `ecdsa_context`
