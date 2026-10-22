@@ -19,6 +19,12 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.2.0** — bloom observability + build-time FPR guard: firmware logs
+  theory FPR at boot and exposes `bloomChecks/bloomMisses/flashChecks/
+  bloomPass/bloomFprTheory` in `/stats.json`; `build_blocklist.py` gains
+  `--target-fpr/--max-domains/--truncate` with per-suffix + per-query
+  estimates; README documents default sources (StevenBlack + Hagezi Light)
+  and the 128 KB sizing table (140–170k sweet spot).
 - **v1.1.0** — single-app max-blocklist variant (`partitions-single.csv`,
   `env:c3-single`: 1.25 MB firmware slot + ~2.75 MB LittleFS for ~540k
   domains, firmware updates via USB/web flasher only); honest
