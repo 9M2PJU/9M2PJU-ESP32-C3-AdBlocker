@@ -19,6 +19,11 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.1.0** — single-app max-blocklist variant (`partitions-single.csv`,
+  `env:c3-single`: 1.25 MB firmware slot + ~2.75 MB LittleFS for ~540k
+  domains, firmware updates via USB/web flasher only); honest
+  filesystem-full errors on blocklist upload (live + staging need ~2x, FS
+  usage now visible in `/stats.json` + dashboard); dual-OTA stays default.
 - **v1.0.9** — pinned PlatformIO `espressif32@7.1.3`: the floating platform
   had moved to 8.x (Arduino core 3.x), whose firmware (~1.42 MB) overflows
   the 0x150000 app slot; the pinned toolchain builds at ~1.06 MB.
