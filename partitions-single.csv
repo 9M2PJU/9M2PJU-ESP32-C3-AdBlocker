@@ -1,0 +1,15 @@
+# Single-app "max-blocklist" layout for 4MB flash: one firmware slot (NO
+# firmware OTA rollback) + a fat LittleFS for the blocklist.
+# Firmware updates on this layout are done over USB (esptool / PlatformIO /
+# web flasher reflash). Blocklist updates still work over WiFi (dashboard
+# upload + remote auto-update) for lists that fit the staging window.
+#
+# Layout: factory app 1.25MB (~200KB headroom over the ~1.10MB build),
+# LittleFS ~2.75MB (~540k domains with the 128KB bloom; the 537k "ultimate"
+# list fits a single copy but NOT a live+staging pair, so flash it via USB
+# with `pio run -e c3-single -t uploadfs`).
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x5000
+phy_init,   data, phy,     0xe000,   0x1000
+factory,    app,  factory, 0x10000,  0x140000
+spiffs,     data, spiffs,  0x150000, 0x2b0000

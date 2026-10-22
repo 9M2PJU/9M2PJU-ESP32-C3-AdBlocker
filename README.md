@@ -419,8 +419,32 @@ The dashboard at **http://c3adblock.local** does it all:
   as the DNS server. Disable your router's DHCP first, then toggle this on.
 
 **4 MB flash tradeoff:** firmware OTA needs *two* app slots, which leaves ~1.3 MB for the
-blocklist (**~250k domains max**). The aggressive 537k "ultimate" list only fits the
-single-app partition table (no firmware OTA). Pick your tradeoff in `partitions.csv`.
+blocklist. Note the swap stages the replacement next to the live file (peak ~2x),
+so dashboard/remote blocklist OTA tops out around **~115–120k domains** — beyond
+that you get an honest "filesystem full" rejection instead of a crash. The bundled
+~115k list fits comfortably. For bigger lists use the single-app variant below.
+
+### Single-app variant: max blocklist, USB firmware updates
+
+Need the aggressive ~500k "ultimate" list? Build with the single-app layout —
+one 1.25 MB firmware slot (no OTA rollback) + ~2.75 MB LittleFS (~540k domains
+with the 128 KB bloom):
+
+```bash
+pio run -e c3-single -t upload       # firmware over USB (erases + flashes)
+pio run -e c3-single -t uploadfs     # blocklist filesystem over USB
+```
+
+Rules for this variant:
+- **Firmware updates are USB-only** (esptool / PlatformIO / web flasher reflash).
+  The dashboard `/update` endpoint and ArduinoOTA refuse with an explanatory
+  message instead of risking the running image — there is no rollback slot.
+- **Blocklist still updates over WiFi** (dashboard upload + remote auto-update)
+  for lists that fit the live+staging window. The full ultimate list itself must
+  be flashed via USB (`uploadfs` writes a fresh filesystem image, single copy).
+- At ~537k domains the 128 KB RAM bloom runs at high FPR (or malloc fails and
+  lookups transparently fall back to flash binary search — slower but correct).
+  This is expected: a 40-bit hash table that big simply outgrows a C3's RAM filter.
 
 ## How domain matching works
 

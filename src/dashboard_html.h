@@ -168,7 +168,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
       <button class=primary>Flash firmware</button>
       <span id=fwmsg style=color:#8b949e></span>
     </form>
-    <div class=hint>Upload <code>firmware.bin</code> &mdash; device validates the image and safely reboots into it.</div>
+    <div class=hint>Upload <code>firmware.bin</code> &mdash; device validates the image and safely reboots into it. Single-app (max-blocklist) builds have no firmware OTA slot: reflash those over USB (web flasher / esptool).</div>
   </div>
 
   <footer>
@@ -188,7 +188,8 @@ T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.9'),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.0.9')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
 ['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
 ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
 .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');

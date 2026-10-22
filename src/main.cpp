@@ -828,10 +828,22 @@ static void handleStats() {
   char ut[24];
   snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String bloomStr = bloomFilter ? (String(bloomBits / 8 / 1024) + " KB") : String("off");
+  // Filesystem usage: the blocklist swap stages "/blocklist.new" alongside
+  // the live file, so peak use is ~2x the list size. Expose it so a full
+  // FS fails with an honest message instead of a guru meditation.
+  size_t fsTotal = LittleFS.totalBytes();
+  size_t fsUsed = LittleFS.usedBytes();
 
   String j = "{\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
-             ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked +
+             ",\"single_app\":" +
+#ifdef SINGLE_APP
+             "true"
+#else
+             "false"
+#endif
+             + ",\"ip\":\"" + WiFi.localIP().toString() + "\",\"blocked\":" + totalBlocked +
              ",\"allowed\":" + totalAllowed + ",\"domains\":" + numHashes +
+             ",\"fstotal\":" + fsTotal + ",\"fsused\":" + fsUsed +
              ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
              ",\"bloom\":\"" + jesc(bloomStr) + "\",\"pending\":" + pendingCount +
@@ -1118,6 +1130,17 @@ static bool commitNewBlocklist() {
         size_t expected = BL_HEADER_SIZE + (bb + 7) / 8 + (size_t)nh * HASH_BYTES;
         if (sz == expected && nh > 0) ok = true;
         else if (nh == 0) { LOGN("[bl] rejecting empty blocklist"); swapStatus = "empty blocklist"; }
+        else {
+          // Short write: almost always a full LittleFS (the swap stages
+          // "/blocklist.new" next to the live file, so peak use is ~2x).
+          LOG("[bl] truncated: got %u of %u bytes (FS %u/%u used)\n",
+              (unsigned)sz, (unsigned)expected,
+              (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+          swapStatus = "truncated upload (" + String((unsigned)sz) + " of " +
+                       String((unsigned)expected) + " bytes) — filesystem full? " +
+                       "the live list + replacement need ~2x the list size free; " +
+                       "use a smaller list or flash via USB (uploadfs)";
+        }
       } else {
         LOGN("[bl] bad header");
       }
@@ -1168,11 +1191,23 @@ static bool commitNewBlocklist() {
 // ---- OTA blocklist update (browser upload: .bin + optional .sig) ----
 static bool upOk = false;
 static bool upGotBin = false;
+static bool upWriteErr = false;  // LittleFS write failed mid-upload (FS full)
 static File upFile;
 static bool upIsSig = false;
 static void handleUploadDone() {
   bool doCommit = upGotBin;
   upGotBin = false;  // consumed — a later request without a .bin must not commit
+  if (upWriteErr) {
+    upWriteErr = false;
+    LittleFS.remove("/blocklist.new");
+    LittleFS.remove("/blocklist.new.sig");
+    LOGN("[ota] write error — filesystem full?");
+    web.send(500, "text/plain",
+             "rejected: filesystem full — the live list + replacement need "
+             "~2x the list size free; use a smaller list or flash via USB (uploadfs)");
+    return;
+  }
+  upWriteErr = false;
   if (!doCommit) {
     LittleFS.remove("/blocklist.new.sig");
     web.send(upOk ? 200 : 400, "text/plain",
@@ -1193,6 +1228,7 @@ static void handleUpload() {
   switch (u.status) {
     case UPLOAD_FILE_START:
       upOk = false;
+      upWriteErr = false;
       upIsSig = u.filename.endsWith(".sig");
       if (upFile) upFile.close();
       if (upIsSig) {
@@ -1205,7 +1241,10 @@ static void handleUpload() {
       LOG("[ota] receiving %s\n", u.filename.c_str());
       break;
     case UPLOAD_FILE_WRITE:
-      if (upFile) upFile.write(u.buf, u.currentSize);
+      if (upFile && upFile.write(u.buf, u.currentSize) != u.currentSize) {
+        upWriteErr = true;  // FS full mid-upload; commit is refused in Done
+        LOGN("[ota] write failed — filesystem full?");
+      }
       break;
     case UPLOAD_FILE_END:
       if (upFile) upFile.close();
@@ -1516,6 +1555,10 @@ static bool fetchBlocklist(String url) {
 
 // ---- firmware OTA ----
 static void handleFwUpdateDone() {
+#ifdef SINGLE_APP
+  web.send(400, "text/plain", "firmware OTA unavailable in this single-app build (no rollback slot) — flash over USB: esptool.py write_flash or the web flasher");
+  return;
+#endif
   bool ok = !Update.hasError();
   String msg = ok ? "ok, rebooting" : ("firmware update failed (error " + String(Update.getError()) + ")");
   web.send(ok ? 200 : 500, "text/plain", msg);
@@ -1529,6 +1572,15 @@ static void handleFwUpload() {
   // cross-origin page cannot set without a passing CORS preflight.
   if (!checkAuth()) { if (u.status == UPLOAD_FILE_START) requireAuth(); return; }
   if (!checkToken()) { if (u.status == UPLOAD_FILE_START) web.send(403, "text/plain", "bad token"); return; }
+#ifdef SINGLE_APP
+  // Single-app layout has no OTA app slot: Update would overwrite the running
+  // image with no rollback. Refuse early instead of bricking the device.
+  if (u.status == UPLOAD_FILE_START) {
+    LOGN("[fw-ota] refused: single-app build — flash firmware over USB (esptool / web flasher)");
+    web.send(400, "text/plain", "firmware OTA unavailable in this single-app build (no rollback slot) — flash over USB: esptool.py write_flash or the web flasher");
+  }
+  return;
+#endif
   if (u.status == UPLOAD_FILE_START) {
     LOG("[fw-ota] %s\n", u.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -1746,7 +1798,11 @@ void setup() {
   web.begin();
 
   ArduinoOTA.setHostname("c3adblock");
+#ifdef SINGLE_APP
+  LOGN("single-app build: network firmware OTA disabled (flash over USB)");
+#else
   ArduinoOTA.begin();
+#endif
 
   if (dhcpEnabled) {
     initDhcpPool();
@@ -1758,7 +1814,9 @@ void setup() {
 }
 
 void loop() {
+#ifndef SINGLE_APP
   ArduinoOTA.handle();
+#endif
   web.handleClient();
   bool busy = false;
   if (handleDns()) busy = true;
