@@ -490,6 +490,32 @@ The firmware validates the magic, version, and hash_bytes on load — a mismatch
 (e.g. wrong `HASH_BYTES`) is rejected instead of silently corrupting lookups.
 Collisions are reported to `blocklist.bin.collisions.txt` by the build script.
 
+## Blocklist sources & sizing (128 KB bloom)
+
+Default build (`tools/build_blocklist.py` with no args):
+StevenBlack base hosts + Hagezi Light (`wildcard/light-onlydomains.txt`) —
+~140k domains, WhatsApp/social safe. Hagezi is deduplicated and well curated;
+OISD is a solid alternative for a balanced list. AdGuard filter syntax is
+deliberately not parsed (regex/modifier rules don't map to a hash list).
+
+Measured guide (128 KB = 1,048,576 bits, optimal k; per-query assumes
+~2 suffix checks per query, `1-(1-p)^2`):
+
+| domains | k | FPR per-suffix | FPR per-query |
+|---|---|---|---|
+| 140k | 5 | ~2.7% | ~5.4% |
+| 150k | 5 | ~3.5% | ~6.8% |
+| 160k | 5 | ~4.3% | ~8.5% |
+| 170k | 4 | ~5.2% | ~10.1% |
+| 200k | 4 | ~8.1% | ~15.6% |
+
+Rule of thumb: 140–170k is the sweet spot (per-suffix FPR ≤ 5%).
+The build script enforces this: `--target-fpr 0.05` warns (and `--truncate`
+caps, `--max-domains N` caps explicitly), printing both estimates.
+The firmware logs the theory FPR at boot (`[bl] ... theory FPR x.xx%`) and
+exposes runtime counters in `/stats.json` (`bloomChecks`, `bloomMisses`,
+`flashChecks`, `bloomPass` = measured pass rate, `bloomFprTheory`).
+
 ## Gotchas (learned the hard way)
 
 - **ModemManager** (default on Fedora/Ubuntu) grabs `/dev/ttyACM0` and toggles

@@ -162,6 +162,24 @@ uint8_t* bloomFilter = nullptr;     // malloc'd RAM bloom filter
 uint32_t bloomBits = 0;
 uint8_t bloomK = 0;
 
+// ---- bloom observability (feet on the ground) ----
+// Per-suffix counters: every parent suffix does one bloom check.
+// bloomMisses = filter said "definitely not in list" -> flash skipped.
+// flashChecks = bloom said "maybe" -> flash binary search ran.
+static uint32_t bloomChecks = 0;
+static uint32_t bloomMisses = 0;
+static uint32_t flashChecks = 0;
+static float bloomFprTheory = 0;  // (1 - e^(-k*n/m))^k at load time
+
+static float bloomTheoryFpr(uint32_t n, uint32_t m, uint8_t k) {
+  if (n == 0 || m == 0 || k == 0) return 0;
+  float x = (float)k * (float)n / (float)m;
+  // 1 - e^-x, guarded (x small here so expf is safe)
+  float p = 1.0f - expf(-x);
+  if (p <= 0) return 0;
+  return powf(p, (float)k);
+}
+
 static bool bloomMayContain(uint64_t h64) {
   if (!bloomFilter || bloomBits == 0 || bloomK == 0) return true; // fail open -> check flash
   uint32_t h1 = (uint32_t)(h64 & 0xFFFFFFFF);
@@ -224,7 +242,10 @@ static bool isBlocked(const char* domain, size_t dlen) {
   while (remaining > 0) {
     uint64_t h64 = fnv64(p, remaining);
     uint64_t h40 = h64 & HASH_MASK;
+    bloomChecks++;
     bool checkFlash = bloomMayContain(h64);  // false = definitely not in list, skip flash
+    if (checkFlash) flashChecks++;
+    else bloomMisses++;
     if (checkFlash && (inFlash(h40) || inCustom(h40))) return true;
     const char* dot = (const char*)memchr(p, '.', remaining);
     if (!dot) break;
@@ -828,6 +849,9 @@ static void handleStats() {
   char ut[24];
   snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
   String bloomStr = bloomFilter ? (String(bloomBits / 8 / 1024) + " KB") : String("off");
+  // Measured bloom pass rate (suffix level): flashChecks / bloomChecks.
+  // Per-query flash probability is higher (~1-(1-p)^s for s suffixes).
+  float bloomPass = bloomChecks ? (float)flashChecks / (float)bloomChecks : 0;
   // Filesystem usage: the blocklist swap stages "/blocklist.new" alongside
   // the live file, so peak use is ~2x the list size. Expose it so a full
   // FS fails with an honest message instead of a guru meditation.
@@ -846,7 +870,11 @@ static void handleStats() {
              ",\"fstotal\":" + fsTotal + ",\"fsused\":" + fsUsed +
              ",\"rssi\":" + WiFi.RSSI() + ",\"temp\":" + String(temperatureRead(), 1) +
              ",\"heap\":" + ESP.getFreeHeap() + ",\"uptime\":\"" + ut + "\"" +
-             ",\"bloom\":\"" + jesc(bloomStr) + "\",\"pending\":" + pendingCount +
+             ",\"bloom\":\"" + jesc(bloomStr) + "\",\"bloomChecks\":" + bloomChecks +
+             ",\"bloomMisses\":" + bloomMisses + ",\"flashChecks\":" + flashChecks +
+             ",\"bloomPass\":" + String(bloomPass, 4) +
+             ",\"bloomFprTheory\":" + String(bloomFprTheory, 4) +
+             ",\"pending\":" + pendingCount +
              ",\"dhcp\":" + (dhcpEnabled ? "true" : "false") +
              ",\"wifi\":\"" + jesc(WiFi.SSID()) + "\"" +
              ",\"token\":\"" + jesc(authToken) + "\"" +
@@ -964,6 +992,9 @@ static void loadBloomFromBlocklist(File& f) {
   bloomBits = bb;
   bloomK = k;
   hashTableOffset = BL_HEADER_SIZE + bloomBytes;
+  // New list -> reset runtime counters and refresh theory estimate.
+  bloomChecks = 0; bloomMisses = 0; flashChecks = 0;
+  bloomFprTheory = bloomTheoryFpr(numHashes, bloomBits, bloomK);
   if (bloomBits > 0 && bloomK > 0) {
     bloomFilter = (uint8_t*)malloc(bloomBytes);
     if (bloomFilter) {
@@ -1100,8 +1131,9 @@ static void reopenBlocklist() {
   loadBloomFromBlocklist(blocklist);
   blSigned = blocklist && LittleFS.exists(BLOCKLIST_SIG_PATH) &&
              verifyBlocklistSig(BLOCKLIST_PATH, BLOCKLIST_SIG_PATH);
-  if (blocklist) LOG("[bl] %lu domains, bloom %lu bits k=%lu, %s\n",
-                     (unsigned long)numHashes, (unsigned long)bloomBits, (unsigned long)bloomK, blSigned ? "signed" : "unverified");
+  if (blocklist) LOG("[bl] %lu domains, bloom %lu bits k=%u, theory FPR %.2f%%, %s\n",
+                     (unsigned long)numHashes, (unsigned long)bloomBits, (unsigned)bloomK,
+                     (double)(bloomFprTheory * 100.0f), blSigned ? "signed" : "unverified");
 }
 static void beginBlocklistSwap() {
   // Keep serving the live blocklist while the replacement downloads/uploads.

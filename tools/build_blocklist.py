@@ -77,6 +77,29 @@ def optimal_k(num_items: int, bloom_bits: int) -> int:
     k = round((bloom_bits / num_items) * math.log(2))
     return max(1, min(k, 30))
 
+def fpr_estimate(num_items: int, bloom_bits: int, k: int) -> float:
+    """Per-suffix false-positive rate: (1 - e^(-k*n/m))^k."""
+    if num_items == 0 or bloom_bits == 0 or k == 0:
+        return 0.0
+    return (1 - math.exp(-k * num_items / bloom_bits)) ** k
+
+def per_query_fpr(p_suffix: float, suffixes: int = 2) -> float:
+    """User-visible rate: P(any of s suffix checks hits) = 1-(1-p)^s.
+    Most queries test ~2 suffixes (host + parent, stopping before TLD)."""
+    return 1 - (1 - p_suffix) ** suffixes
+
+def max_domains_for_fpr(bloom_bits: int, target: float) -> int:
+    """Largest n whose optimal-k FPR stays under target (binary search)."""
+    lo, hi, best = 1, 2000000, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = optimal_k(mid, bloom_bits)
+        if fpr_estimate(mid, bloom_bits, k) <= target:
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+    return best
+
 def bloom_positions(h64: int, bloom_bits: int, k: int):
     """Double hashing: g_i = (h1 + i * h2) % m."""
     h1 = h64 & 0xFFFFFFFF
@@ -93,6 +116,12 @@ def main():
     ap.add_argument('--bloom-bits', type=int, default=DEFAULT_BLOOM_BITS,
                     help=f'Bloom filter size in bits (default: {DEFAULT_BLOOM_BITS} = 128 KB)')
     ap.add_argument('--no-bloom', action='store_true', help='skip Bloom filter')
+    ap.add_argument('--target-fpr', type=float, default=None, metavar='P',
+                    help='warn if per-suffix FPR exceeds P (e.g. 0.05)')
+    ap.add_argument('--max-domains', type=int, default=None, metavar='N',
+                    help='cap the list at N domains (first N sorted; prefer smaller sources)')
+    ap.add_argument('--truncate', action='store_true',
+                    help='with --target-fpr, auto-cap to max domains meeting the target')
     ap.add_argument('--sign-key', default=None, metavar='PRIVKEY_PEM',
                     help='also write OUT.sig: DER ECDSA P-256 signature over the .bin '
                          '(verified by firmware against src/blocklist_pubkey.h)')
@@ -122,6 +151,16 @@ def main():
 
     # Compute 40-bit hashes for the sorted flash table
     domain_list = sorted(domains)
+    if args.max_domains and len(domain_list) > args.max_domains:
+        print(f'  !! capping {len(domain_list):,} -> {args.max_domains:,} domains '
+              f'(--max-domains; for quality prefer smaller sources)', file=sys.stderr)
+        domain_list = domain_list[:args.max_domains]
+    if args.truncate and args.target_fpr and bloom_bits > 0:
+        cap = max_domains_for_fpr(bloom_bits, args.target_fpr)
+        if len(domain_list) > cap:
+            print(f'  !! truncating {len(domain_list):,} -> {cap:,} domains '
+                  f'to meet target FPR {args.target_fpr:.1%}', file=sys.stderr)
+            domain_list = domain_list[:cap]
     hash_to_domains = {}
     for d in domain_list:
         h40 = fnv40(d.encode())
@@ -167,6 +206,9 @@ def main():
     if bloom_bits > 0 and k > 0 and num_hashes > 0:
         fpr = (1 - math.exp(-k * num_hashes / bloom_bits)) ** k
 
+    print(f'sources          :')
+    for s in sources:
+        print(f'  - {s}')
     print(f'source domains   : {len(domains):,}')
     print(f'hash entries     : {num_hashes:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {len(colliding_domains)} groups, {num_collisions} extra domains sharing a 40-bit hash -> over-block')
@@ -176,9 +218,15 @@ def main():
             for h, doms in sorted(colliding_domains):
                 cf.write(f'0x{h:010x}: {", ".join(doms)}\n')
         print(f'  (details -> {coll_path})')
-    print(f'bloom filter     : {bloom_kb:.0f} KB, k={k}, FPR~{fpr:.1%}')
+    print(f'bloom filter     : {bloom_kb:.0f} KB, k={k}, FPR(suffix)~{fpr:.2%}, '
+          f'FPR(query,~2 suffixes)~{per_query_fpr(fpr):.2%}')
     print(f'flash blob       : {blob_size:,} bytes  ({blob_size/1024/1024:.2f} MB)  -> {args.out}')
     print(f'lookup           : ~{math.ceil(math.log2(max(num_hashes,2)))} flash reads/query (bloom miss = 0)')
+    if args.target_fpr is not None and fpr > args.target_fpr:
+        cap = max_domains_for_fpr(bloom_bits, args.target_fpr)
+        print(f'  !! WARNING: FPR {fpr:.2%} exceeds target {args.target_fpr:.2%} '
+              f'for {bloom_kb:.0f} KB bloom; max ~{cap:,} domains meet it '
+              f'(re-run with --truncate or --max-domains {cap})', file=sys.stderr)
 
     if args.sign_key:
         from sign_blocklist import sign_file
