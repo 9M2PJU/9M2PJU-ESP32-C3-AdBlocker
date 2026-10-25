@@ -2,6 +2,43 @@
 // Dashboard HTML — served from PROGMEM with ETag/Cache-Control.
 // Split into its own header so main.cpp stays readable.
 
+const char LOGIN_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>C3 AdBlock — Sign In</title><style>
+*{box-sizing:border-box}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:28px 24px;width:100%;max-width:360px}
+.brand{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+h1{margin:0;font-size:20px;font-weight:600}h1 span{color:#3fb950}
+.sub{color:#8b949e;font-size:13px;margin-bottom:20px}
+.err{background:#f8514920;border:1px solid #f8514960;color:#f85149;padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:16px;display:none}
+label{display:block;font-size:12px;color:#8b949e;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:10px 12px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}
+input:focus{border-color:#58a6ff}
+button{width:100%;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;padding:10px 14px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+button:hover{background:#2ea043}
+</style></head><body>
+<div class=card>
+  <div class=brand>
+    <h1><span>C3</span> AdBlock</h1>
+  </div>
+  <div class=sub>Sign in to manage ad-blocking and network settings.</div>
+  <div class=err id=errmsg>Invalid username or password</div>
+  <form method=POST action=/login>
+    <label>Username</label>
+    <input name=username id=u autofocus required autocomplete=username value="admin">
+    <label>Password</label>
+    <input name=password type=password id=p required autocomplete=current-password placeholder="Enter password">
+    <button type=submit>Sign In</button>
+  </form>
+</div>
+<script>
+if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
+let q=new URLSearchParams(location.search);
+let em=document.getElementById('errmsg');
+if(q.get('err')==='1'){em.style.display='block';}
+else if(q.get('err')==='429'){em.textContent='Too many attempts — retry later';em.style.display='block';}
+</script></body></html>)HTML";
+
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>C3 AdBlock</title><style>
 *{box-sizing:border-box}
@@ -71,7 +108,10 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <h1><span>C3</span> AdBlock</h1>
     <span class=badge id=fwver>v1.2.0</span>
   </div>
-  <span class=host-pill id=host></span>
+  <div style="display:flex;align-items:center;gap:8px">
+    <span class=host-pill id=host></span>
+    <a href="/logout" style="color:#f85149;font-size:12px;font-family:monospace;background:#21262d;padding:3px 8px;border-radius:6px;border:1px solid #30363d;text-decoration:none">Log out</a>
+  </div>
 </header>
 <div class=wrap>
   <div class=cards id=sys></div>
@@ -171,6 +211,17 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <div class=hint>Upload <code>firmware.bin</code> &mdash; device validates the image and safely reboots into it. Single-app (max-blocklist) builds have no firmware OTA slot: reflash those over USB (web flasher / esptool).</div>
   </div>
 
+  <div class=panel>
+    <div class=panel-head><h2>Admin Credentials</h2></div>
+    <div class="row row-full" style="margin-bottom:6px">
+      <input id=newu placeholder="Admin Username" class=flex-1 value="admin">
+      <input id=newp type=password placeholder="New Password" class=flex-1>
+      <button onclick=saveAuth()>Save Credentials</button>
+      <span id=authmsg style=color:#8b949e></span>
+    </div>
+    <div class=hint>Change the username and password used to sign in to this dashboard.</div>
+  </div>
+
   <footer>
     <div class=sponsor-bar>
       <a href="https://buymeacoffee.com/9m2pju" target="_blank" rel="noopener" class="sponsor-btn bmac-btn">☕ Buy Me a Coffee</a>
@@ -179,49 +230,67 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <div>9M2PJU ESP32-C3 AdBlocker &middot; <a href="https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker" target="_blank" rel="noopener">GitHub</a> &middot; <a href="https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/" target="_blank" rel="noopener">Web Flasher</a></div>
   </footer>
 </div><script>
+if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
 let T='';
-function fmt(n){return n.toLocaleString()}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmt(n){return (n||0).toLocaleString()}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function H(){return {'X-CSRF-Token':T}}
-async function load(){let s=await(await fetch('/stats.json')).json();
-T=s.token||'';
-host.textContent='@ '+s.ip;
-if(s.version)fwver.textContent='v'+s.version;
-sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
-['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
-['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
-['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
-.map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${encodeURIComponent(c.ip)}',{headers:H()}).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch('/unblock?d=${encodeURIComponent(d)}',{headers:H()}).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';
-sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optional')+(s.keyid?' ('+s.keyid+')':''))||'—';
-dhcpst.textContent=s.dhcp?'ON':'OFF';
-dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
-wifi.textContent=s.wifi||'—';
-if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
-function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-function toggleDhcp(){fetch('/dhcp',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
-function toggleSigReq(){fetch('/sigrequire',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
+function api(path,opt={}){
+  let url=location.origin+(path.startsWith('/')?'':'/')+path;
+  let headers=Object.assign({},H(),opt.headers||{});
+  return fetch(url,Object.assign({},opt,{headers})).then(r=>{
+    if(r.status===401){window.location.href='/login';}
+    return r;
+  });
+}
+async function load(){
+  let res;
+  try{res=await api('/stats.json');}catch(_){return;}
+  if(!res||!res.ok)return;
+  let s;
+  try{s=await res.json();}catch(_){return;}
+  T=s.token||'';
+  host.textContent='@ '+s.ip;
+  if(s.version)fwver.textContent='v'+s.version;
+  if(s.admin_user&&document.activeElement!=newu)newu.value=s.admin_user;
+  sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
+  ['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+  ['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
+  ['Clients',s.clients?s.clients.length:0,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
+  ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
+  .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
+  if(s.clients)ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
+  `<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
+  <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
+  <td><button class=ban onclick="api('/ban?ip=${encodeURIComponent(c.ip)}').then(load).catch(alert)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+  if(s.custom)cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="api('/unblock?d=${encodeURIComponent(d)}').then(load).catch(alert)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+  if(document.activeElement!=uurl)uurl.value=s.upurl||'';
+  if(document.activeElement!=uiv)uiv.value=s.upiv||24;
+  ustat.textContent=s.upstat||'—';
+  sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optional')+(s.keyid?' ('+s.keyid+')':''))||'—';
+  dhcpst.textContent=s.dhcp?'ON':'OFF';
+  dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
+  wifi.textContent=s.wifi||'—';
+  if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
+}
+function addDom(){let d=dom.value.trim();if(d){api('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()}).catch(e=>alert('Failed: '+e.message))}}
+function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;api('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24)).then(load).catch(e=>alert('Failed: '+e.message))}
+function fetchNow(){ustat.textContent='fetching...';api('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()}).catch(e=>{ustat.textContent='err: '+e.message})}
+function toggleDhcp(){api('/dhcp').then(r=>r.text()).then(t=>{alert(t);load()}).catch(e=>alert('Failed: '+e.message))}
+function toggleSigReq(){api('/sigrequire').then(r=>r.text()).then(t=>{alert(t);load()}).catch(e=>alert('Failed: '+e.message))}
 function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.textContent='enter SSID';return}
-wmsg.textContent='saving...';fetch('/setwifi',{method:'POST',headers:Object.assign({'Content-Type':'application/x-www-form-urlencoded'},H()),body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
-function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch('/settxpower?p='+encodeURIComponent(p),{headers:H()}).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
+wmsg.textContent='saving...';api('/setwifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;}).catch(e=>{wmsg.textContent='err: '+e.message;})}
+function saveAuth(){let u=newu.value.trim(),p=newp.value.trim();if(!u||!p){authmsg.textContent='enter username and password';return;}
+authmsg.textContent='saving...';api('/setauth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{authmsg.textContent=t;setTimeout(()=>{authmsg.textContent='';},3000);}).catch(e=>{authmsg.textContent='err: '+e.message;})}
+function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';api('/settxpower?p='+encodeURIComponent(p)).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)}).catch(e=>{txmsg.textContent='err: '+e.message;})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/update',{method:'POST',headers:H(),body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
+try{let r=await api('/update',{method:'POST',body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
 catch(err){fwmsg.textContent='err: '+err.message;}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);let g=sgf.files[0];if(g)fd.append('g',g);
-try{let r=await fetch('/upload',{method:'POST',headers:H(),body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
+try{let r=await api('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
 catch(_){upmsg.textContent='upload failed';}
 blf.value='';sgf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
