@@ -414,11 +414,16 @@ The dashboard at **http://c3adblock.local** does it all:
   lists — keeping the live list on any failure. The dashboard shows whether the
   live list is `signed` or `UNVERIFIED` and lets you toggle "require-signed".
 - **WiFi & Thermals** — change the WiFi network and configure WiFi TX power (from 2 dBm
-  up to 19.5 dBm, default 8.5 dBm) directly from the dashboard. Modem sleep
-  (`WIFI_PS_MIN_MODEM`) + CPU idle yielding are the main idle coolers; lower TX
-  power only trims TX bursts (~1–3 °C). Expect ~45–55 °C on a SuperMini in a case —
-  keep vents open, antenna clear, and use a stable 5V/1A supply. If `RSSI < -70 dBm`,
+  up to 19.5 dBm, default 8.5 dBm) and WiFi power-save (`min` = modem sleep,
+  `none` = always on) directly from the dashboard. Modem sleep + CPU idle
+  yielding are the main idle coolers; lower TX power only trims TX bursts
+  (~1–3 °C). Expect ~45–55 °C on a SuperMini in a case — keep vents open,
+  antenna clear, and use a stable 5V/1A supply. If `RSSI < -70 dBm`,
   raise TX instead: a weak signal causes retries (more heat + failed fetches).
+  If the serial log shows `CCMP replay detected` + `WiFi connect failed` loops
+  (some TP-Link APs with modem sleep), set power-save to `none`. Reconnects
+  do a clean disconnect/re-associate, re-bind DNS/mDNS sockets, and reboot
+  after ~5 min continuously offline to recover a wedged radio.
   Remote-fetch failures now report `HTTP -1 (connection refused) [wifi:up rssi:-xx heap:xxk]`
   or `DNS failed for <host>` so heap vs DNS vs TLS is distinguishable in serial + dashboard.
 - **Firmware** — upload `.pio/build/c3/firmware.bin` under *Firmware → OTA update*; the

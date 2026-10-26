@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.2.0</span>
+    <span class=badge id=fwver>v1.2.1</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -136,7 +136,19 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
       </select>
       <span id=txmsg style=color:#8b949e></span>
     </div>
-    <div class=hint>Lower transmit power significantly reduces ESP32-C3 PCB temperature and prevents regulator overheating.</div>
+    <div class=hint>Lower transmit power significantly reduces ESP32-C3 PCB temperature and prevents regulator overheating. If signal is weaker than -70 dBm, use 11 dBm or higher — 2/5 dBm with a weak signal causes retries, CCMP-replay drops and disconnects.</div>
+
+    <hr class=div>
+
+    <div style="font-weight:600;font-size:11px;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">WiFi Power-Save (Modem Sleep)</div>
+    <div class="row row-full" style="margin-bottom:6px">
+      <select id=pssel onchange=savePs() class=flex-1>
+        <option value="min">min (Modem sleep — cooler, default)</option>
+        <option value="none">none (Always on — stable on flaky APs)</option>
+      </select>
+      <span id=psmsg style=color:#8b949e></span>
+    </div>
+    <div class=hint>If the log shows repeated <code>CCMP replay detected</code> + <code>WiFi connect failed</code> loops, switch to <code>none</code>. Takes full effect on the next reconnect.</div>
 
     <hr class=div>
 
@@ -205,7 +217,8 @@ sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optio
 dhcpst.textContent=s.dhcp?'ON':'OFF';
 dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
 wifi.textContent=s.wifi||'—';
-if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;}
+if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
+if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
 function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
@@ -214,6 +227,7 @@ function toggleSigReq(){fetch('/sigrequire',{headers:H()}).then(r=>r.text()).the
 function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.textContent='enter SSID';return}
 wmsg.textContent='saving...';fetch('/setwifi',{method:'POST',headers:Object.assign({'Content-Type':'application/x-www-form-urlencoded'},H()),body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
 function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch('/settxpower?p='+encodeURIComponent(p),{headers:H()}).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
+function savePs(){let m=pssel.value;psmsg.textContent='saving...';fetch('/setwifips?m='+encodeURIComponent(m),{headers:H()}).then(r=>r.text()).then(t=>{psmsg.textContent=t;setTimeout(()=>{psmsg.textContent='';load()},1500)})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
 try{let r=await fetch('/update',{method:'POST',headers:H(),body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
