@@ -50,7 +50,7 @@
 #include "mbedtls/bignum.h"
 #include "mbedtls/version.h"
 #include "secrets.h"
-#include "dashboard_html.h"
+#include "resources.h"
 #include "blocklist_pubkey.h"
 
 // ---- config ----
@@ -870,7 +870,7 @@ static void handleRoot() {
   if (web.header("If-None-Match") == DASHBOARD_ETAG) { web.send(304); return; }
   web.sendHeader("Cache-Control", "max-age=3600");
   web.sendHeader("ETag", DASHBOARD_ETAG);
-  web.send_P(200, "text/html", PAGE);
+  web.send_P(200, "text/html", DASHBOARD_HTML);
 }
 
 // ---- blocklist signature state (verified in the signature section below) ----
