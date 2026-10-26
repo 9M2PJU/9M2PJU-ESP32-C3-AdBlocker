@@ -233,10 +233,46 @@ static bool inCustom(uint64_t h) {
   return false;
 }
 
+// ---- pause state (in-RAM, defaults to active blocking on reboot) ----
+bool pauseBlocking = false;
+uint32_t pauseExpiresMs = 0;      // millis() timestamp; 0 = indefinite
+bool pauseBypassCustom = true;    // true = bypass custom domains too; false = keep custom blocked
+
+static inline bool isPauseActive() {
+  if (!pauseBlocking) return false;
+  if (pauseExpiresMs > 0) {
+    if ((int32_t)(millis() - pauseExpiresMs) >= 0) {
+      pauseBlocking = false;
+      pauseExpiresMs = 0;
+      return false;
+    }
+  }
+  return true;
+}
+
 // ---- isBlocked: check domain + parent suffixes, bloom-pre-filtered ----
 // Walks parent suffixes: ads.x.example -> x.example -> example.
 // Stops before the bare TLD (a block on "com" would break everything).
 static bool isBlocked(const char* domain, size_t dlen) {
+  if (isPauseActive()) {
+    if (pauseBypassCustom) return false;
+    // Main blocklist is bypassed, but custom domains must still be checked
+    const char* p = domain;
+    size_t remaining = dlen;
+    while (remaining > 0) {
+      uint64_t h64 = fnv64(p, remaining);
+      uint64_t h40 = h64 & HASH_MASK;
+      if (inCustom(h40)) return true;
+      const char* dot = (const char*)memchr(p, '.', remaining);
+      if (!dot) break;
+      size_t consumed = (size_t)(dot - p) + 1;
+      remaining -= consumed;
+      p = dot + 1;
+      if (!memchr(p, '.', remaining)) break;
+    }
+    return false;
+  }
+
   const char* p = domain;
   size_t remaining = dlen;
   while (remaining > 0) {
@@ -920,6 +956,15 @@ static void handleStats() {
   size_t fsTotal = LittleFS.totalBytes();
   size_t fsUsed = LittleFS.usedBytes();
 
+  uint32_t pauseRemS = 0;
+  bool isPaused = isPauseActive();
+  if (isPaused && pauseExpiresMs > 0) {
+    uint32_t now = millis();
+    if ((int32_t)(pauseExpiresMs - now) > 0) {
+      pauseRemS = (pauseExpiresMs - now) / 1000UL;
+    }
+  }
+
   String j = "{\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
              ",\"single_app\":" +
 #ifdef SINGLE_APP
@@ -938,6 +983,9 @@ static void handleStats() {
              ",\"bloomFprTheory\":" + String(bloomFprTheory, 4) +
              ",\"pending\":" + pendingCount +
              ",\"dhcp\":" + (dhcpEnabled ? "true" : "false") +
+             ",\"paused\":" + (isPaused ? "true" : "false") +
+             ",\"pause_rem_s\":" + pauseRemS +
+             ",\"pause_bypass_custom\":" + (pauseBypassCustom ? "true" : "false") +
              ",\"wifi\":\"" + jesc(WiFi.SSID()) + "\"" +
              ",\"token\":\"" + jesc(authToken) + "\"" +
              ",\"admin_user\":\"" + jesc(authUsername) + "\"" +
@@ -1005,6 +1053,30 @@ static void handleDhcpToggle() {
     dhcpSock.stop();
     web.send(200, "text/plain", "DHCP disabled");
   }
+}
+
+static void handlePause() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  int m = web.hasArg("m") ? web.arg("m").toInt() : 5;
+  if (m < 0) m = 0;
+  if (m > 1440) m = 1440; // cap at 24 hours
+  pauseBlocking = true;
+  pauseExpiresMs = (m > 0) ? (millis() + (uint32_t)m * 60000UL) : 0;
+  if (web.hasArg("custom")) {
+    pauseBypassCustom = (web.arg("custom") == "1");
+  }
+  LOG("[pause] blocking paused: %d min, bypass_custom=%d\n", m, pauseBypassCustom);
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleResume() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  pauseBlocking = false;
+  pauseExpiresMs = 0;
+  LOGN("[pause] blocking resumed");
+  web.send(200, "text/plain", "ok");
 }
 
 static void handleSetWifi() {
@@ -1892,6 +1964,8 @@ void setup() {
     web.send(400, "text/plain", "invalid power level");
   });
   web.on("/dhcp", handleDhcpToggle);
+  web.on("/pause", handlePause);
+  web.on("/resume", handleResume);
   web.on("/setwifi", HTTP_POST, handleSetWifi);
   web.on("/sigrequire", handleSigRequire);
   web.begin();

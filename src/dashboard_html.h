@@ -88,6 +88,19 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 .sponsor-btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;font-size:12px;text-decoration:none;font-weight:600}
 .bmac-btn{background:#ffdd00;color:#000}.pp-btn{background:#0070ba;color:#fff}
 
+.pause-banner{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 16px;margin-bottom:14px;transition:all .2s ease}
+.pause-banner.paused{background:#1b160b;border-color:#d29922}
+.p-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px}
+.p-title{font-weight:600;font-size:13px;display:flex;align-items:center;gap:6px}
+.p-dot{width:8px;height:8px;border-radius:50%;background:#3fb950;display:inline-block}
+.p-dot.paused{background:#d29922;box-shadow:0 0 6px #d29922}
+.preset-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer}
+.preset-btn:hover{background:#30363d;color:#58a6ff}
+.btn-pause{background:#9e6a03;color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+.btn-pause:hover{background:#bb8009}
+.btn-resume{background:#238636;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+.btn-resume:hover{background:#2ea043}
+
 @media(max-width:640px){
   header{padding:10px 14px}
   .wrap{padding:12px 10px}
@@ -114,6 +127,45 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
   </div>
 </header>
 <div class=wrap>
+  <div class="pause-banner" id="pnbanner">
+    <div id="pactive_box">
+      <div class="p-header">
+        <div class="p-title"><span class="p-dot"></span> Protection Active</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:11px;color:#8b949e">Quick presets:</span>
+          <button type="button" class="preset-btn" onclick="setPreset(5)">5m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(15)">15m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(30)">30m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(60)">1h</button>
+          <button type="button" class="preset-btn" onclick="setPreset(0)">Indefinite</button>
+        </div>
+      </div>
+      <div class="row row-full" style="align-items:center;gap:10px">
+        <div style="display:inline-flex;align-items:center;gap:6px">
+          <span style="font-size:13px;color:#8b949e">Duration:</span>
+          <input id="pmin" type="number" min="0" max="1440" value="5" style="width:65px;padding:4px 8px">
+          <span style="font-size:12px;color:#8b949e">min</span>
+        </div>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#8b949e;cursor:pointer">
+          <input id="pcust" type="checkbox" checked style="margin:0"> Also bypass custom blocked domains
+        </label>
+        <button class="btn-pause" onclick="pauseBlocking()">Pause Blocking</button>
+      </div>
+    </div>
+    <div id="ppaused_box" style="display:none">
+      <div class="p-header">
+        <div class="p-title" style="color:#e3b341"><span class="p-dot paused"></span> Protection Paused</div>
+        <button class="btn-resume" onclick="resumeBlocking()">Resume Protection</button>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <div style="font-size:14px;color:#f0f6fc">
+          Remaining: <span id="prem" style="font-weight:700;color:#e3b341;font-family:monospace">--:--</span>
+        </div>
+        <div id="pscope" style="font-size:12px;color:#8b949e"></div>
+      </div>
+    </div>
+  </div>
+
   <div class=cards id=sys></div>
 
   <div class=panel>
@@ -272,6 +324,7 @@ async function load(){
   dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
   wifi.textContent=s.wifi||'—';
   if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
+  if(s.hasOwnProperty('paused')){updatePauseUi(s.paused,s.pause_rem_s,s.pause_bypass_custom);}
 }
 function addDom(){let d=dom.value.trim();if(d){api('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()}).catch(e=>alert('Failed: '+e.message))}}
 function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;api('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24)).then(load).catch(e=>alert('Failed: '+e.message))}
@@ -293,6 +346,44 @@ let fd=new FormData();fd.append('f',f);let g=sgf.files[0];if(g)fd.append('g',g);
 try{let r=await api('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
 catch(_){upmsg.textContent='upload failed';}
 blf.value='';sgf.value='';setTimeout(load,600);};
+let pauseRemainingSec=0;
+function setPreset(m){pmin.value=m;}
+function fmtDuration(s){
+  if(s<=0)return '0s';
+  let m=Math.floor(s/60),rem=s%60;
+  if(m>=60){let h=Math.floor(m/60);m=m%60;return h+'h '+m+'m '+rem+'s';}
+  return (m>0?(m+'m '):'')+rem+'s';
+}
+function updatePauseUi(isPaused,remSec,bypassCustom){
+  pauseRemainingSec=remSec||0;
+  if(isPaused){
+    pnbanner.classList.add('paused');
+    pactive_box.style.display='none';
+    ppaused_box.style.display='block';
+    pscope.textContent=bypassCustom?'Custom domains: bypassed':'Custom domains: still blocked';
+    prem.textContent=(remSec>0)?fmtDuration(remSec):'Indefinite (until resumed)';
+  }else{
+    pnbanner.classList.remove('paused');
+    pactive_box.style.display='block';
+    ppaused_box.style.display='none';
+  }
+}
+function pauseBlocking(){
+  let m=parseInt(pmin.value);
+  if(isNaN(m)||m<0)m=5;
+  let c=pcust.checked?1:0;
+  api('/pause?m='+m+'&custom='+c).then(()=>load()).catch(e=>alert('Failed to pause: '+e.message));
+}
+function resumeBlocking(){
+  api('/resume').then(()=>load()).catch(e=>alert('Failed to resume: '+e.message));
+}
+setInterval(()=>{
+  if(pauseRemainingSec>0){
+    pauseRemainingSec--;
+    prem.textContent=fmtDuration(pauseRemainingSec);
+    if(pauseRemainingSec===0)load();
+  }
+},1000);
 load();setInterval(load,3000);
 </script></body></html>)HTML";
 
