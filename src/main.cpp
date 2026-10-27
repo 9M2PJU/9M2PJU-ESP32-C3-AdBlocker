@@ -70,7 +70,7 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.2.0";
+static const char* FIRMWARE_VERSION = "1.2.1";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
 
 // ---- WiFi TX power & thermal configuration ----
@@ -121,6 +121,43 @@ static void saveTxPowerCfg() {
   f.close();
 }
 
+// ---- WiFi power-save (modem sleep) configuration ----
+// MIN_MODEM naps the radio between beacons (cooler, less power) but some
+// APs (notably TP-Link with weak RSSI / low TX) answer with retried frames
+// that show up as "CCMP replay detected" and eventually drop the link.
+// NONE keeps the radio awake: warmer, but far more stable. Persisted in
+// /wifips.cfg ("min" or "none"), dashboard-tunable, defaults to "min"
+// to preserve the documented thermal behaviour.
+static String wifiPsSetting = "min";
+
+static bool applyWifiPs(const String& p) {
+  if (p == "none") {
+    wifiPsSetting = "none";
+    WiFi.setSleep(WIFI_PS_NONE);
+    return true;
+  }
+  if (p == "min") {
+    wifiPsSetting = "min";
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+    return true;
+  }
+  return false;
+}
+static void loadWifiPsCfg() {
+  File f = LittleFS.open("/wifips.cfg", "r");
+  if (!f) { wifiPsSetting = "min"; return; }
+  String p = f.readStringUntil('\n'); p.trim(); p.toLowerCase();
+  f.close();
+  if (p != "none" && p != "min") p = "min";
+  wifiPsSetting = p;
+}
+static void saveWifiPsCfg() {
+  File f = LittleFS.open("/wifips.cfg", "w");
+  if (!f) return;
+  f.println(wifiPsSetting);
+  f.close();
+}
+
 // ---- logging ----
 #ifdef NDEBUG
 #define LOG(...) ((void)0)
@@ -140,6 +177,7 @@ bool dhcpEnabled = false;
 static void saveDhcpCfg();
 static void saveWifiCfg(const String& ssid, const String& pass);
 static bool fetchBlocklist(String url);
+static void saveUpdateCfg();
 
 // ---- hashing ----------
 static uint64_t fnv64(const char* s, size_t n) {
@@ -992,6 +1030,7 @@ static void handleStats() {
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
              ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"txpower\":\"" + txPowerSetting + "\"" +
+             ",\"wifips\":\"" + wifiPsSetting + "\"" +
              ",\"blsig\":\"" + (blSigned ? "signed" : "unverified") + "\"" +
              ",\"sigreq\":" + (requireSigned ? "true" : "false") +
              ",\"keyid\":\"" + BL_KEY_ID + "\"" +
@@ -1440,6 +1479,31 @@ static void normalizeUpdateUrl(String &u) {
   // HTTPS properly, so assume https when no scheme is present.
   if (u.length() && u.indexOf("://") < 0) u = "https://" + u;
 }
+// Host part of a URL, lower-cased, without port/brackets.
+static String updateUrlHost(const String& u) {
+  int schemeEnd = u.indexOf("://");
+  String host = (schemeEnd >= 0) ? u.substring(schemeEnd + 3) : u;
+  int slash = host.indexOf('/');
+  if (slash >= 0) host = host.substring(0, slash);
+  int colon = host.indexOf(':');
+  // Keep IPv6 "[::1]:port" intact for the compare below, strip other ports.
+  if (colon >= 0 && !(host.startsWith("[") && host.endsWith("]"))) {
+    // A bare IPv6 literal contains multiple colons — don't truncate it.
+    if (host.indexOf(':') == colon) host = host.substring(0, colon);
+  }
+  host.trim(); host.toLowerCase();
+  return host;
+}
+// Reject URLs that point back at this device — fetching 127.0.0.1 /
+// localhost blocks DNS for seconds and can never succeed (there is no
+// blocklist server on the C3 itself). Seen in the wild via dashboard typo.
+static bool isLoopbackUpdateUrl(const String& u) {
+  String h = updateUrlHost(u);
+  if (h == "localhost" || h == "0.0.0.0" || h == "::1" || h == "[::1]") return true;
+  if (h.startsWith("127.")) return true;
+  if (h == "127.0.0.1" || h == "[::1]") return true;
+  return false;
+}
 static void loadUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "r");
   if (!f) {
@@ -1452,6 +1516,12 @@ static void loadUpdateCfg() {
   f.close();
   if (!updateUrl.length()) updateUrl = DEFAULT_UPDATE_URL;
   normalizeUpdateUrl(updateUrl);
+  if (isLoopbackUpdateUrl(updateUrl)) {
+    LOG("[remote] stored update URL points at this device (%s) — resetting to default\n",
+        updateUrl.c_str());
+    updateUrl = DEFAULT_UPDATE_URL;
+    saveUpdateCfg();
+  }
   if (updateIntervalH < 1) updateIntervalH = 1;
 }
 static void saveUpdateCfg() {
@@ -1524,6 +1594,11 @@ static bool fetchBlocklist(String url) {
   url.trim();
   if (!url.length()) url = DEFAULT_UPDATE_URL;
   normalizeUpdateUrl(url);
+  if (isLoopbackUpdateUrl(url)) {
+    updateStatus = "rejected: update URL points at this device (" + url + ") — use the GitHub Pages or releases URL [" + netDiag() + "]";
+    LOG("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
   if (WiFi.status() != WL_CONNECTED) {
     updateStatus = "wifi not connected [" + netDiag() + "]";
     LOG("[remote] %s\n", updateStatus.c_str());
@@ -1788,28 +1863,69 @@ static bool connectWiFi() {
 
   if (!trySsid) return false;
 
+  // Full clean (re)associate: leftover state from a stale association is
+  // what produces the "CCMP replay detected" storm + endless connect-failed
+  // loops after the AP reboots or rekeys. Disconnect first, then begin.
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("c3adblock");
+  WiFi.disconnect(false, true);
+  delay(100);
   WiFi.mode(WIFI_STA);
-  // MIN_MODEM (modem sleep) is the biggest idle-thermal win: the radio naps
-  // between beacons instead of staying fully powered (WIFI_PS_NONE). Cost is
-  // ~50-100 ms extra latency on the first packet after idle, which DNS
-  // tolerates (2 s client timeout). TX power only affects TX bursts (<5%
-  // duty), so it alone moves idle temp by 1-3 C.
-  WiFi.setSleep(WIFI_PS_MIN_MODEM);
+  applyWifiPs(wifiPsSetting);
+  // LOW-rate / long-range modes off: keep normal rates so ACKs get through.
   WiFi.begin(trySsid, tryPass);
   applyTxPower(txPowerSetting);
-  LOG("WiFi: connecting to %s", trySsid);
+  // setSleep can be reset by begin() on some cores — re-apply after.
+  applyWifiPs(wifiPsSetting);
+  LOG("WiFi: connecting to %s (ps:%s tx:%s)", trySsid,
+      wifiPsSetting.c_str(), txPowerSetting.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) {
     delay(300); Serial.print(".");
   }
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
     applyTxPower(txPowerSetting);
-    LOGN("\nWiFi up: " + WiFi.localIP().toString());
+    applyWifiPs(wifiPsSetting);
+    LOG("\nWiFi up: %s rssi:%d\n",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    if (WiFi.RSSI() < -70 && (txPowerSetting == "2" || txPowerSetting == "5")) {
+      LOGN("[wifi] WARNING: weak signal with low TX power — raise TX power "
+           "(/settxpower 11..15) or set power-save to none (/setwifips)");
+    }
     return true;
   }
   LOGN("\nWiFi connect failed");
-  WiFi.disconnect();
+  WiFi.disconnect(false);
   return false;
+}
+
+// Re-bind everything that depends on the STA interface after a
+// disconnect/reconnect: UDP sockets go deaf and mDNS stops answering when
+// the interface drops, even after WL_CONNECTED returns.
+static bool mdnsRunning = false;
+static void rebindNetServices() {
+  dnsServer.stop();
+  upstream.stop();
+  tcpUpstream.stop();
+  if (dhcpEnabled) dhcpSock.stop();
+  if (tcpDnsClient) tcpDnsClient.stop();
+  dnsServer.begin(DNS_PORT);
+  upstream.begin(0);
+  tcpUpstream.begin(0);
+  tcpDnsServer.begin();
+  if (dhcpEnabled) {
+    initDhcpPool();
+    dhcpSock.begin(DHCP_PORT);
+  }
+  if (mdnsRunning) {
+    MDNS.end();
+    mdnsRunning = false;
+  }
+  if (MDNS.begin("c3adblock")) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsRunning = true;
+  }
 }
 
 // ---- captive portal ----
@@ -1905,10 +2021,19 @@ void setup() {
   loadUpdateCfg();
   loadDhcpCfg();
   loadTxPowerCfg();
+  loadWifiPsCfg();
   loadSigReq();
   reopenBlocklist();
-  LOG("[cfg] custom:%d banned:%d user:%s pass:%s txpower:%s\n", numCustom, numBanned, authUsername.c_str(), authPassword.c_str(), txPowerSetting.c_str());
+  LOG("[cfg] custom:%d banned:%d user:%s pass:%s txpower:%s wifips:%s\n", numCustom, numBanned, authUsername.c_str(), authPassword.c_str(), txPowerSetting.c_str(), wifiPsSetting.c_str());
   LOGN("[cfg] dashboard credentials -> username: " + authUsername + " password: " + authPassword);
+
+  // Log the driver-level disconnect reason so "connection lost after a
+  // while" stops being a mystery (auth fail? AP took us down? beacon loss?).
+  WiFi.onEvent([](WiFiEvent_t event) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+      LOGN("[wifi] disconnected (beacon loss / AP deauth / rekey — will retry)");
+    }
+  });
 
   if (!connectWiFi()) {
     runCaptivePortal();  // blocks forever (reboots on save)
@@ -1917,6 +2042,7 @@ void setup() {
 
   if (MDNS.begin("c3adblock")) {
     MDNS.addService("http", "tcp", 80);
+    mdnsRunning = true;
     LOGN("dashboard: http://c3adblock.local");
   }
 
@@ -1945,7 +2071,14 @@ void setup() {
   web.on("/setupdate", []() {
     if (!checkAuth()) { requireAuth(); return; }
     if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
-    if (web.hasArg("u")) { updateUrl = web.arg("u"); normalizeUpdateUrl(updateUrl); }
+    if (web.hasArg("u")) {
+      String u = web.arg("u"); normalizeUpdateUrl(u);
+      if (isLoopbackUpdateUrl(u)) {
+        web.send(400, "text/plain", "update URL points at this device — use the GitHub Pages or releases URL");
+        return;
+      }
+      updateUrl = u;
+    }
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg();
     web.send(200, "text/plain", "ok");
@@ -1957,17 +2090,37 @@ void setup() {
       String p = web.arg("p");
       if (applyTxPower(p)) {
         saveTxPowerCfg();
-        web.send(200, "text/plain", "ok");
+        if (WiFi.RSSI() < -70 && (p == "2" || p == "5"))
+          web.send(200, "text/plain", "ok — warning: weak signal with low TX, expect drops");
+        else
+          web.send(200, "text/plain", "ok");
         return;
       }
     }
     web.send(400, "text/plain", "invalid power level");
+  });
+  web.on("/setwifips", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    if (web.hasArg("m")) {
+      String m = web.arg("m"); m.trim(); m.toLowerCase();
+      if (applyWifiPs(m)) {
+        saveWifiPsCfg();
+        web.send(200, "text/plain", String("ok — power-save ") + wifiPsSetting + " (takes full effect on next reconnect)");
+        return;
+      }
+    }
+    web.send(400, "text/plain", "invalid mode (min|none)");
   });
   web.on("/dhcp", handleDhcpToggle);
   web.on("/pause", handlePause);
   web.on("/resume", handleResume);
   web.on("/setwifi", HTTP_POST, handleSetWifi);
   web.on("/sigrequire", handleSigRequire);
+  // Silence the "[E][WebServer.cpp] request handler not found" spam from
+  // browsers (favicon) and LAN scanners: explicit 204 + quiet 404.
+  web.on("/favicon.ico", []() { web.send(204); });
+  web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
 
   ArduinoOTA.setHostname("c3adblock");
@@ -2001,14 +2154,26 @@ void loop() {
   // Reconnect WiFi if the AP/router rebooted (connectWiFi() only ran at boot).
   // Throttled so a down network doesn't busy-loop; DNS is broken while
   // offline anyway, so a blocking 15 s retry here is acceptable.
+  // Failsafe: a C3 radio that flaps for ~5 min straight is wedged — reboot
+  // to get a clean WPA rekey instead of CCMP-replay looping forever.
+  static uint32_t lastRetryMs = 0;
+  static uint8_t wifiFailStreak = 0;
   if (WiFi.status() != WL_CONNECTED) {
-    static uint32_t lastRetryMs = 0;
     uint32_t nowW = millis();
     if (nowW - lastRetryMs >= 10000UL) {
       lastRetryMs = nowW;
       busy = true;
-      if (connectWiFi() && dhcpEnabled) initDhcpPool();  // IP may have changed
+      if (connectWiFi()) {
+        wifiFailStreak = 0;
+        rebindNetServices();  // sockets + mDNS go deaf across an outage
+      } else if (++wifiFailStreak >= 12) {
+        LOGN("[wifi] offline ~5 min, rebooting to recover radio");
+        delay(500);
+        ESP.restart();
+      }
     }
+  } else {
+    wifiFailStreak = 0;
   }
 
   // Track DNS activity for idle-gated remote fetch (set in handleDns/pollUpstream)
@@ -2033,7 +2198,7 @@ void loop() {
 
   // Yield CPU to FreeRTOS idle task when there is no active traffic.
   // This allows the RISC-V core to enter the low-power WFI sleep state.
-  // Combined with WIFI_PS_MIN_MODEM (see connectWiFi) this is the main idle
+  // Combined with modem sleep (see applyWifiPs) this is the main idle
   // cooler; TX power alone only affects TX bursts.
   if (!busy) {
     delay(1);

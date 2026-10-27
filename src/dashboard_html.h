@@ -119,7 +119,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.2.0</span>
+    <span class=badge id=fwver>v1.2.1</span>
   </div>
   <div style="display:flex;align-items:center;gap:8px">
     <span class=host-pill id=host></span>
@@ -228,7 +228,19 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
       </select>
       <span id=txmsg style=color:#8b949e></span>
     </div>
-    <div class=hint>Lower transmit power significantly reduces ESP32-C3 PCB temperature and prevents regulator overheating.</div>
+    <div class=hint>Lower transmit power significantly reduces ESP32-C3 PCB temperature and prevents regulator overheating. If signal is weaker than -70 dBm, use 11 dBm or higher — 2/5 dBm with a weak signal causes retries, CCMP-replay drops and disconnects.</div>
+
+    <hr class=div>
+
+    <div style="font-weight:600;font-size:11px;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">WiFi Power-Save (Modem Sleep)</div>
+    <div class="row row-full" style="margin-bottom:6px">
+      <select id=pssel onchange=savePs() class=flex-1>
+        <option value="min">min (Modem sleep — cooler, default)</option>
+        <option value="none">none (Always on — stable on flaky APs)</option>
+      </select>
+      <span id=psmsg style=color:#8b949e></span>
+    </div>
+    <div class=hint>If the log shows repeated <code>CCMP replay detected</code> + <code>WiFi connect failed</code> loops, switch to <code>none</code>. Takes full effect on the next reconnect.</div>
 
     <hr class=div>
 
@@ -306,7 +318,7 @@ async function load(){
   if(s.version)fwver.textContent='v'+s.version;
   if(s.admin_user&&document.activeElement!=newu)newu.value=s.admin_user;
   sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-  ['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+  ['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.1')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
   ['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
   ['Clients',s.clients?s.clients.length:0,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
   ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
@@ -324,6 +336,7 @@ async function load(){
   dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
   wifi.textContent=s.wifi||'—';
   if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
+  if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;
   if(s.hasOwnProperty('paused')){updatePauseUi(s.paused,s.pause_rem_s,s.pause_bypass_custom);}
 }
 function addDom(){let d=dom.value.trim();if(d){api('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()}).catch(e=>alert('Failed: '+e.message))}}
@@ -336,6 +349,7 @@ wmsg.textContent='saving...';api('/setwifi',{method:'POST',headers:{'Content-Typ
 function saveAuth(){let u=newu.value.trim(),p=newp.value.trim();if(!u||!p){authmsg.textContent='enter username and password';return;}
 authmsg.textContent='saving...';api('/setauth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{authmsg.textContent=t;setTimeout(()=>{authmsg.textContent='';},3000);}).catch(e=>{authmsg.textContent='err: '+e.message;})}
 function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';api('/settxpower?p='+encodeURIComponent(p)).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)}).catch(e=>{txmsg.textContent='err: '+e.message;})}
+function savePs(){let m=pssel.value;psmsg.textContent='saving...';api('/setwifips?m='+encodeURIComponent(m)).then(r=>r.text()).then(t=>{psmsg.textContent=t;setTimeout(()=>{psmsg.textContent='';load()},1500)}).catch(e=>{psmsg.textContent='err: '+e.message;})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
 try{let r=await api('/update',{method:'POST',body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
