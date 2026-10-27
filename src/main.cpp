@@ -1027,6 +1027,7 @@ static void handleStats() {
              ",\"wifi\":\"" + jesc(WiFi.SSID()) + "\"" +
              ",\"token\":\"" + jesc(authToken) + "\"" +
              ",\"admin_user\":\"" + jesc(authUsername) + "\"" +
+             ",\"admin_pass\":\"" + jesc(authPassword) + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
              ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"txpower\":\"" + txPowerSetting + "\"" +

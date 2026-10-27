@@ -25,13 +25,17 @@ button:hover{background:#2ea043}
   <div class=err id=errmsg>Invalid username or password</div>
   <form method=POST action=/login>
     <label>Username</label>
-    <input name=username id=u autofocus required autocomplete=username value="admin">
+    <input name=username id=u autofocus required autocomplete=username placeholder="Enter username">
     <label>Password</label>
-    <input name=password type=password id=p required autocomplete=current-password placeholder="Enter password">
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <input name=password type=password id=p required autocomplete=current-password placeholder="Enter password" style="margin-bottom:0;flex:1">
+      <button type=button onclick="togglePass('p',this)" style="width:auto;padding:8px 14px;background:#21262d;border:1px solid #30363d;color:#c9d1d9">Show</button>
+    </div>
     <button type=submit>Sign In</button>
   </form>
 </div>
 <script>
+function togglePass(id,btn){let inp=document.getElementById(id);if(!inp)return;let isPass=inp.type==='password';inp.type=isPass?'text':'password';btn.textContent=isPass?'Hide':'Show';}
 if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
 let q=new URLSearchParams(location.search);
 let em=document.getElementById('errmsg');
@@ -278,8 +282,11 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
   <div class=panel>
     <div class=panel-head><h2>Admin Credentials</h2></div>
     <div class="row row-full" style="margin-bottom:6px">
-      <input id=newu placeholder="Admin Username" class=flex-1 value="admin">
-      <input id=newp type=password placeholder="New Password" class=flex-1>
+      <input id=newu placeholder="Admin Username" class=flex-1>
+      <div style="display:flex;gap:6px" class=flex-1>
+        <input id=newp type=password placeholder="Admin Password" class=flex-1 style="margin:0">
+        <button type=button onclick="togglePass('newp',this)" style="padding:4px 10px;background:#21262d;border:1px solid #30363d;color:#c9d1d9">Show</button>
+      </div>
       <button onclick=saveAuth()>Save Credentials</button>
       <span id=authmsg style=color:#8b949e></span>
     </div>
@@ -296,6 +303,8 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 </div><script>
 if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
 let T='';
+let authLoaded=false;
+function togglePass(id,btn){let inp=document.getElementById(id);if(!inp)return;let isPass=inp.type==='password';inp.type=isPass?'text':'password';btn.textContent=isPass?'Hide':'Show';}
 function fmt(n){return (n||0).toLocaleString()}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function H(){return {'X-CSRF-Token':T}}
@@ -316,7 +325,7 @@ async function load(){
   T=s.token||'';
   host.textContent='@ '+s.ip;
   if(s.version)fwver.textContent='v'+s.version;
-  if(s.admin_user&&document.activeElement!=newu)newu.value=s.admin_user;
+  if(!authLoaded&&s.admin_user&&s.admin_pass){newu.value=s.admin_user;newp.value=s.admin_pass;authLoaded=true;}
   sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
   ['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.1')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
   ['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
