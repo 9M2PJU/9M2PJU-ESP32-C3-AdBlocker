@@ -16,3 +16,5 @@ tools/blocklist_signing.key
 # Backups / scratch
 *.bak
 tools/__pycache__/
+
+docs/superpowers

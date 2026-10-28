@@ -169,7 +169,7 @@ static void saveWifiPsCfg() {
 
 // ---- forward declarations ----
 WebServer web(80);
-static const char* COLLECTED_HEADERS[] = {"Authorization", "If-None-Match", "Origin", "Referer", "X-CSRF-Token"};
+static const char* COLLECTED_HEADERS[] = {"Cookie", "If-None-Match", "Origin", "Referer", "X-CSRF-Token"};
 String updateUrl, updateStatus = "never";
 uint32_t updateIntervalH = 24, lastCheckMs = 0;
 static uint32_t lastDnsActivityMs = 0;
@@ -271,20 +271,60 @@ static bool inCustom(uint64_t h) {
   return false;
 }
 
+// ---- pause state (in-RAM, defaults to active blocking on reboot) ----
+bool pauseBlocking = false;
+uint32_t pauseExpiresMs = 0;      // millis() timestamp; 0 = indefinite
+bool pauseBypassCustom = true;    // true = bypass custom domains too; false = keep custom blocked
+
+static inline bool isPauseActive() {
+  if (!pauseBlocking) return false;
+  if (pauseExpiresMs > 0) {
+    if ((int32_t)(millis() - pauseExpiresMs) >= 0) {
+      pauseBlocking = false;
+      pauseExpiresMs = 0;
+      return false;
+    }
+  }
+  return true;
+}
+
 // ---- isBlocked: check domain + parent suffixes, bloom-pre-filtered ----
 // Walks parent suffixes: ads.x.example -> x.example -> example.
 // Stops before the bare TLD (a block on "com" would break everything).
 static bool isBlocked(const char* domain, size_t dlen) {
+  if (isPauseActive()) {
+    if (pauseBypassCustom) return false;
+    // Main blocklist is bypassed, but custom domains must still be checked
+    const char* p = domain;
+    size_t remaining = dlen;
+    while (remaining > 0) {
+      uint64_t h64 = fnv64(p, remaining);
+      uint64_t h40 = h64 & HASH_MASK;
+      if (inCustom(h40)) return true;
+      const char* dot = (const char*)memchr(p, '.', remaining);
+      if (!dot) break;
+      size_t consumed = (size_t)(dot - p) + 1;
+      remaining -= consumed;
+      p = dot + 1;
+      if (!memchr(p, '.', remaining)) break;
+    }
+    return false;
+  }
+
   const char* p = domain;
   size_t remaining = dlen;
   while (remaining > 0) {
     uint64_t h64 = fnv64(p, remaining);
     uint64_t h40 = h64 & HASH_MASK;
+    if (inCustom(h40)) return true;
     bloomChecks++;
     bool checkFlash = bloomMayContain(h64);  // false = definitely not in list, skip flash
-    if (checkFlash) flashChecks++;
-    else bloomMisses++;
-    if (checkFlash && (inFlash(h40) || inCustom(h40))) return true;
+    if (checkFlash) {
+      flashChecks++;
+      if (inFlash(h40)) return true;
+    } else {
+      bloomMisses++;
+    }
     const char* dot = (const char*)memchr(p, '.', remaining);
     if (!dot) break;
     size_t consumed = (size_t)(dot - p) + 1;
@@ -772,26 +812,12 @@ static bool handleDhcp() {
   return true;
 }
 
-// ---- auth (Basic Auth + CSRF token) ----
+// ---- auth (Session Cookie + CSRF token) ----
+String authUsername = "admin";
 String authPassword;
-String authToken;
+String authToken;             // CSRF token
+String currentSessionToken;   // active browser session token
 
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static String b64encode(const String& s) {
-  String o;
-  const uint8_t* in = (const uint8_t*)s.c_str();
-  int len = s.length();
-  for (int i = 0; i < len; i += 3) {
-    uint32_t n = (uint32_t)in[i] << 16;
-    if (i + 1 < len) n |= (uint32_t)in[i+1] << 8;
-    if (i + 2 < len) n |= in[i+2];
-    o += B64[(n >> 18) & 0x3F];
-    o += B64[(n >> 12) & 0x3F];
-    o += (i + 1 < len) ? B64[(n >> 6) & 0x3F] : '=';
-    o += (i + 2 < len) ? B64[n & 0x3F] : '=';
-  }
-  return o;
-}
 static void genToken();
 static void genRandomPassword() {
   const char chars[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
@@ -808,26 +834,41 @@ static void genToken() {
   snprintf(t, sizeof(t), "%08x%08x", (unsigned)a, (unsigned)b);
   authToken = String(t);
 }
+static void saveAuthCfg() {
+  File f = LittleFS.open("/auth.cfg", "w");
+  if (!f) return;
+  f.println(authUsername);
+  f.println(authPassword);
+  f.println(authToken);
+  f.close();
+}
 static void loadAuth() {
   File f = LittleFS.open("/auth.cfg", "r");
   if (f) {
+    authUsername = f.readStringUntil('\n'); authUsername.trim();
     authPassword = f.readStringUntil('\n'); authPassword.trim();
     authToken = f.readStringUntil('\n'); authToken.trim();
     f.close();
   }
+  if (authUsername.length() == 0) authUsername = "admin";
   if (authPassword.length() == 0) {
     genRandomPassword();  // sets password + token
   } else {
-    genToken();           // keep the password, rotate the token every boot
+    genToken();           // keep credentials, rotate CSRF token on boot
   }
-  {
-    File fo = LittleFS.open("/auth.cfg", "w");
-    if (fo) { fo.println(authPassword); fo.println(authToken); fo.close(); }
-  }
+  saveAuthCfg();
 }
 static bool checkAuth() {
-  String expected = "Basic " + b64encode("admin:" + authPassword);
-  return web.header("Authorization") == expected;
+  if (currentSessionToken.length() == 0) return false;
+  String cookie = web.header("Cookie");
+  if (cookie.length() == 0) return false;
+  int idx = cookie.indexOf("session=");
+  if (idx < 0) return false;
+  String val = cookie.substring(idx + 8);
+  int end = val.indexOf(';');
+  if (end >= 0) val = val.substring(0, end);
+  val.trim();
+  return val == currentSessionToken;
 }
 static bool checkToken() {
   // Header-only on purpose: a query-string token leaks into browser history,
@@ -837,20 +878,73 @@ static bool checkToken() {
 static uint8_t authFails = 0;
 static uint32_t lastAuthFailMs = 0;
 static void requireAuth() {
-  // Tiny brute-force brake: 5 bad password attempts within 60 s -> 429 for a
-  // while. Browsers resend cached Basic credentials automatically, so legit
-  // polling doesn't trip this — only wrong-password guesses do.
-  uint32_t now = millis();
-  if ((now - lastAuthFailMs) > 60000UL) authFails = 0;
-  lastAuthFailMs = now;
-  if (authFails >= 5) {
-    web.sendHeader("Retry-After", "30");
-    web.send(429, "text/plain", "too many auth failures — retry later");
+  web.send(401, "text/plain", "unauthorized");
+}
+
+static void handleLogin() {
+  if (checkAuth()) {
+    web.sendHeader("Location", "/");
+    web.send(302, "text/plain", "");
     return;
   }
-  authFails++;
-  web.sendHeader("WWW-Authenticate", "Basic realm=\"C3 AdBlock\"");
-  web.send(401, "text/plain", "auth required");
+  web.sendHeader("Cache-Control", "no-store");
+  web.send_P(200, "text/html", LOGIN_PAGE);
+}
+
+static void handleLoginSubmit() {
+  uint32_t now = millis();
+  if ((now - lastAuthFailMs) > 60000UL) authFails = 0;
+
+  if (authFails >= 5) {
+    web.sendHeader("Location", "/login?err=429");
+    web.send(302, "text/plain", "");
+    return;
+  }
+
+  String u = web.arg("username");
+  String p = web.arg("password");
+  u.trim(); p.trim();
+
+  if (u == authUsername && p == authPassword) {
+    authFails = 0;
+    uint32_t a = esp_random(), b = esp_random();
+    char s[17];
+    snprintf(s, sizeof(s), "%08x%08x", (unsigned)a, (unsigned)b);
+    currentSessionToken = String(s);
+
+    web.sendHeader("Set-Cookie", "session=" + currentSessionToken + "; Path=/; HttpOnly; SameSite=Lax");
+    web.sendHeader("Location", "/");
+    web.send(302, "text/plain", "");
+  } else {
+    authFails++;
+    lastAuthFailMs = now;
+    web.sendHeader("Location", "/login?err=1");
+    web.send(302, "text/plain", "");
+  }
+}
+
+static void handleLogout() {
+  currentSessionToken = "";
+  web.sendHeader("Set-Cookie", "session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+  web.sendHeader("Location", "/login");
+  web.send(302, "text/plain", "");
+}
+
+static void handleSetAuth() {
+  if (!checkAuth()) { web.send(401, "text/plain", "unauthorized"); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  String u = web.arg("u");
+  String p = web.arg("p");
+  u.trim(); p.trim();
+  if (u.length() == 0 || p.length() == 0) {
+    web.send(400, "text/plain", "missing username or password");
+    return;
+  }
+  authUsername = u;
+  authPassword = p;
+  saveAuthCfg();
+  LOGN("[auth] credentials updated: user=" + authUsername);
+  web.send(200, "text/plain", "saved");
 }
 
 // ---- web server ----
@@ -866,7 +960,11 @@ static String jesc(const String& s) {
 }
 
 static void handleRoot() {
-  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkAuth()) {
+    web.sendHeader("Location", "/login");
+    web.send(302, "text/plain", "");
+    return;
+  }
   if (web.header("If-None-Match") == DASHBOARD_ETAG) { web.send(304); return; }
   web.sendHeader("Cache-Control", "max-age=3600");
   web.sendHeader("ETag", DASHBOARD_ETAG);
@@ -882,7 +980,7 @@ static void saveSigReq();
 static bool verifyBlocklistSig(const char* binPath, const char* sigPath);
 
 static void handleStats() {
-  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkAuth()) { web.send(401, "application/json", "{\"error\":\"unauthorized\"}"); return; }
   uint32_t up = millis() / 1000;
   char ut[24];
   snprintf(ut, sizeof(ut), "%lud %luh %lum", up/86400, (up%86400)/3600, (up%3600)/60);
@@ -895,6 +993,15 @@ static void handleStats() {
   // FS fails with an honest message instead of a guru meditation.
   size_t fsTotal = LittleFS.totalBytes();
   size_t fsUsed = LittleFS.usedBytes();
+
+  uint32_t pauseRemS = 0;
+  bool isPaused = isPauseActive();
+  if (isPaused && pauseExpiresMs > 0) {
+    uint32_t now = millis();
+    if ((int32_t)(pauseExpiresMs - now) > 0) {
+      pauseRemS = (pauseExpiresMs - now) / 1000UL;
+    }
+  }
 
   String j = "{\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
              ",\"single_app\":" +
@@ -914,8 +1021,13 @@ static void handleStats() {
              ",\"bloomFprTheory\":" + String(bloomFprTheory, 4) +
              ",\"pending\":" + pendingCount +
              ",\"dhcp\":" + (dhcpEnabled ? "true" : "false") +
+             ",\"paused\":" + (isPaused ? "true" : "false") +
+             ",\"pause_rem_s\":" + pauseRemS +
+             ",\"pause_bypass_custom\":" + (pauseBypassCustom ? "true" : "false") +
              ",\"wifi\":\"" + jesc(WiFi.SSID()) + "\"" +
              ",\"token\":\"" + jesc(authToken) + "\"" +
+             ",\"admin_user\":\"" + jesc(authUsername) + "\"" +
+             ",\"admin_pass\":\"" + jesc(authPassword) + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
              ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"txpower\":\"" + txPowerSetting + "\"" +
@@ -981,6 +1093,30 @@ static void handleDhcpToggle() {
     dhcpSock.stop();
     web.send(200, "text/plain", "DHCP disabled");
   }
+}
+
+static void handlePause() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  int m = web.hasArg("m") ? web.arg("m").toInt() : 5;
+  if (m < 0) m = 0;
+  if (m > 1440) m = 1440; // cap at 24 hours
+  pauseBlocking = true;
+  pauseExpiresMs = (m > 0) ? (millis() + (uint32_t)m * 60000UL) : 0;
+  if (web.hasArg("custom")) {
+    pauseBypassCustom = (web.arg("custom") == "1");
+  }
+  LOG("[pause] blocking paused: %d min, bypass_custom=%d\n", m, pauseBypassCustom);
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleResume() {
+  if (!checkAuth()) { requireAuth(); return; }
+  if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+  pauseBlocking = false;
+  pauseExpiresMs = 0;
+  LOGN("[pause] blocking resumed");
+  web.send(200, "text/plain", "ok");
 }
 
 static void handleSetWifi() {
@@ -1889,8 +2025,8 @@ void setup() {
   loadWifiPsCfg();
   loadSigReq();
   reopenBlocklist();
-  LOG("[cfg] custom:%d banned:%d auth:%s txpower:%s wifips:%s\n", numCustom, numBanned, authPassword.c_str(), txPowerSetting.c_str(), wifiPsSetting.c_str());
-  LOGN("[cfg] dashboard password: " + authPassword);
+  LOG("[cfg] custom:%d banned:%d user:%s pass:%s txpower:%s wifips:%s\n", numCustom, numBanned, authUsername.c_str(), authPassword.c_str(), txPowerSetting.c_str(), wifiPsSetting.c_str());
+  LOGN("[cfg] dashboard credentials -> username: " + authUsername + " password: " + authPassword);
 
   // Log the driver-level disconnect reason so "connection lost after a
   // while" stops being a mystery (auth fail? AP took us down? beacon loss?).
@@ -1917,6 +2053,10 @@ void setup() {
   tcpDnsServer.begin();
   web.collectHeaders(COLLECTED_HEADERS, sizeof(COLLECTED_HEADERS) / sizeof(char*));
   web.on("/", handleRoot);
+  web.on("/login", HTTP_GET, handleLogin);
+  web.on("/login", HTTP_POST, handleLoginSubmit);
+  web.on("/logout", handleLogout);
+  web.on("/setauth", HTTP_POST, handleSetAuth);
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
   web.on("/addblock", handleAddBlock);
@@ -1974,6 +2114,8 @@ void setup() {
     web.send(400, "text/plain", "invalid mode (min|none)");
   });
   web.on("/dhcp", handleDhcpToggle);
+  web.on("/pause", handlePause);
+  web.on("/resume", handleResume);
   web.on("/setwifi", HTTP_POST, handleSetWifi);
   web.on("/sigrequire", handleSigRequire);
   // Silence the "[E][WebServer.cpp] request handler not found" spam from
