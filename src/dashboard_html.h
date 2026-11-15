@@ -2,6 +2,47 @@
 // Dashboard HTML — served from PROGMEM with ETag/Cache-Control.
 // Split into its own header so main.cpp stays readable.
 
+const char LOGIN_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>C3 AdBlock — Sign In</title><style>
+*{box-sizing:border-box}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;background:#0d1117;color:#c9d1d9;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:28px 24px;width:100%;max-width:360px}
+.brand{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+h1{margin:0;font-size:20px;font-weight:600}h1 span{color:#3fb950}
+.sub{color:#8b949e;font-size:13px;margin-bottom:20px}
+.err{background:#f8514920;border:1px solid #f8514960;color:#f85149;padding:8px 12px;border-radius:6px;font-size:13px;margin-bottom:16px;display:none}
+label{display:block;font-size:12px;color:#8b949e;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:10px 12px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}
+input:focus{border-color:#58a6ff}
+button{width:100%;background:#238636;color:#fff;border:1px solid #2ea043;border-radius:6px;padding:10px 14px;font-size:14px;font-weight:600;cursor:pointer;transition:background .15s}
+button:hover{background:#2ea043}
+</style></head><body>
+<div class=card>
+  <div class=brand>
+    <h1><span>C3</span> AdBlock</h1>
+  </div>
+  <div class=sub>Sign in to manage ad-blocking and network settings.</div>
+  <div class=err id=errmsg>Invalid username or password</div>
+  <form method=POST action=/login>
+    <label>Username</label>
+    <input name=username id=u autofocus required autocomplete=username placeholder="Enter username">
+    <label>Password</label>
+    <div style="display:flex;gap:8px;margin-bottom:16px">
+      <input name=password type=password id=p required autocomplete=current-password placeholder="Enter password" style="margin-bottom:0;flex:1">
+      <button type=button onclick="togglePass('p',this)" style="width:auto;padding:8px 14px;background:#21262d;border:1px solid #30363d;color:#c9d1d9">Show</button>
+    </div>
+    <button type=submit>Sign In</button>
+  </form>
+</div>
+<script>
+function togglePass(id,btn){let inp=document.getElementById(id);if(!inp)return;let isPass=inp.type==='password';inp.type=isPass?'text':'password';btn.textContent=isPass?'Hide':'Show';}
+if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
+let q=new URLSearchParams(location.search);
+let em=document.getElementById('errmsg');
+if(q.get('err')==='1'){em.style.display='block';}
+else if(q.get('err')==='429'){em.textContent='Too many attempts — retry later';em.style.display='block';}
+</script></body></html>)HTML";
+
 const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>C3 AdBlock</title><style>
 *{box-sizing:border-box}
@@ -51,6 +92,19 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 .sponsor-btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;font-size:12px;text-decoration:none;font-weight:600}
 .bmac-btn{background:#ffdd00;color:#000}.pp-btn{background:#0070ba;color:#fff}
 
+.pause-banner{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:12px 16px;margin-bottom:14px;transition:all .2s ease}
+.pause-banner.paused{background:#1b160b;border-color:#d29922}
+.p-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px}
+.p-title{font-weight:600;font-size:13px;display:flex;align-items:center;gap:6px}
+.p-dot{width:8px;height:8px;border-radius:50%;background:#3fb950;display:inline-block}
+.p-dot.paused{background:#d29922;box-shadow:0 0 6px #d29922}
+.preset-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 8px;border-radius:6px;font-size:12px;cursor:pointer}
+.preset-btn:hover{background:#30363d;color:#58a6ff}
+.btn-pause{background:#9e6a03;color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+.btn-pause:hover{background:#bb8009}
+.btn-resume{background:#238636;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px}
+.btn-resume:hover{background:#2ea043}
+
 @media(max-width:640px){
   header{padding:10px 14px}
   .wrap{padding:12px 10px}
@@ -71,9 +125,51 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <h1><span>C3</span> AdBlock</h1>
     <span class=badge id=fwver>v1.2.1</span>
   </div>
-  <span class=host-pill id=host></span>
+  <div style="display:flex;align-items:center;gap:8px">
+    <span class=host-pill id=host></span>
+    <a href="/logout" style="color:#f85149;font-size:12px;font-family:monospace;background:#21262d;padding:3px 8px;border-radius:6px;border:1px solid #30363d;text-decoration:none">Log out</a>
+  </div>
 </header>
 <div class=wrap>
+  <div class="pause-banner" id="pnbanner">
+    <div id="pactive_box">
+      <div class="p-header">
+        <div class="p-title"><span class="p-dot"></span> Protection Active</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:11px;color:#8b949e">Quick presets:</span>
+          <button type="button" class="preset-btn" onclick="setPreset(5)">5m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(15)">15m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(30)">30m</button>
+          <button type="button" class="preset-btn" onclick="setPreset(60)">1h</button>
+          <button type="button" class="preset-btn" onclick="setPreset(0)">Indefinite</button>
+        </div>
+      </div>
+      <div class="row row-full" style="align-items:center;gap:10px">
+        <div style="display:inline-flex;align-items:center;gap:6px">
+          <span style="font-size:13px;color:#8b949e">Duration:</span>
+          <input id="pmin" type="number" min="0" max="1440" value="5" style="width:65px;padding:4px 8px">
+          <span style="font-size:12px;color:#8b949e">min</span>
+        </div>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#8b949e;cursor:pointer">
+          <input id="pcust" type="checkbox" checked style="margin:0"> Also bypass custom blocked domains
+        </label>
+        <button class="btn-pause" onclick="pauseBlocking()">Pause Blocking</button>
+      </div>
+    </div>
+    <div id="ppaused_box" style="display:none">
+      <div class="p-header">
+        <div class="p-title" style="color:#e3b341"><span class="p-dot paused"></span> Protection Paused</div>
+        <button class="btn-resume" onclick="resumeBlocking()">Resume Protection</button>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <div style="font-size:14px;color:#f0f6fc">
+          Remaining: <span id="prem" style="font-weight:700;color:#e3b341;font-family:monospace">--:--</span>
+        </div>
+        <div id="pscope" style="font-size:12px;color:#8b949e"></div>
+      </div>
+    </div>
+  </div>
+
   <div class=cards id=sys></div>
 
   <div class=panel>
@@ -183,6 +279,20 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <div class=hint>Upload <code>firmware.bin</code> &mdash; device validates the image and safely reboots into it. Single-app (max-blocklist) builds have no firmware OTA slot: reflash those over USB (web flasher / esptool).</div>
   </div>
 
+  <div class=panel>
+    <div class=panel-head><h2>Admin Credentials</h2></div>
+    <div class="row row-full" style="margin-bottom:6px">
+      <input id=newu placeholder="Admin Username" class=flex-1>
+      <div style="display:flex;gap:6px" class=flex-1>
+        <input id=newp type=password placeholder="Admin Password" class=flex-1 style="margin:0">
+        <button type=button onclick="togglePass('newp',this)" style="padding:4px 10px;background:#21262d;border:1px solid #30363d;color:#c9d1d9">Show</button>
+      </div>
+      <button onclick=saveAuth()>Save Credentials</button>
+      <span id=authmsg style=color:#8b949e></span>
+    </div>
+    <div class=hint>Change the username and password used to sign in to this dashboard.</div>
+  </div>
+
   <footer>
     <div class=sponsor-bar>
       <a href="https://buymeacoffee.com/9m2pju" target="_blank" rel="noopener" class="sponsor-btn bmac-btn">☕ Buy Me a Coffee</a>
@@ -191,53 +301,112 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <div>9M2PJU ESP32-C3 AdBlocker &middot; <a href="https://github.com/9M2PJU/9M2PJU-ESP32-C3-AdBlocker" target="_blank" rel="noopener">GitHub</a> &middot; <a href="https://9m2pju.github.io/9M2PJU-ESP32-C3-AdBlocker/" target="_blank" rel="noopener">Web Flasher</a></div>
   </footer>
 </div><script>
+if(location.username||location.password){try{history.replaceState(null,'',location.origin+location.pathname+location.search+location.hash);}catch(_){}}
 let T='';
-function fmt(n){return n.toLocaleString()}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+let authLoaded=false;
+function togglePass(id,btn){let inp=document.getElementById(id);if(!inp)return;let isPass=inp.type==='password';inp.type=isPass?'text':'password';btn.textContent=isPass?'Hide':'Show';}
+function fmt(n){return (n||0).toLocaleString()}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function H(){return {'X-CSRF-Token':T}}
-async function load(){let s=await(await fetch('/stats.json')).json();
-T=s.token||'';
-host.textContent='@ '+s.ip;
-if(s.version)fwver.textContent='v'+s.version;
-sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
-['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
-['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
-['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
-.map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
-ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
-`<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
-<td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
-<td><button class=ban onclick="fetch('/ban?ip=${encodeURIComponent(c.ip)}',{headers:H()}).then(load)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
-cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="fetch('/unblock?d=${encodeURIComponent(d)}',{headers:H()}).then(load)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
-if(document.activeElement!=uurl)uurl.value=s.upurl||'';
-if(document.activeElement!=uiv)uiv.value=s.upiv||24;
-ustat.textContent=s.upstat||'—';
-sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optional')+(s.keyid?' ('+s.keyid+')':''))||'—';
-dhcpst.textContent=s.dhcp?'ON':'OFF';
-dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
-wifi.textContent=s.wifi||'—';
-if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
-if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;}
-function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
-function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
-function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
-function toggleDhcp(){fetch('/dhcp',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
-function toggleSigReq(){fetch('/sigrequire',{headers:H()}).then(r=>r.text()).then(t=>{alert(t);load()})}
+function api(path,opt={}){
+  let url=location.origin+(path.startsWith('/')?'':'/')+path;
+  let headers=Object.assign({},H(),opt.headers||{});
+  return fetch(url,Object.assign({},opt,{headers})).then(r=>{
+    if(r.status===401){window.location.href='/login';}
+    return r;
+  });
+}
+async function load(){
+  let res;
+  try{res=await api('/stats.json');}catch(_){return;}
+  if(!res||!res.ok)return;
+  let s;
+  try{s=await res.json();}catch(_){return;}
+  T=s.token||'';
+  host.textContent='@ '+s.ip;
+  if(s.version)fwver.textContent='v'+s.version;
+  if(!authLoaded&&s.admin_user&&s.admin_pass){newu.value=s.admin_user;newp.value=s.admin_pass;authLoaded=true;}
+  sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
+  ['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.1')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+  ['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
+  ['Clients',s.clients?s.clients.length:0,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
+  ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
+  .map(c=>`<div class=card><div class="v ${c[2]}">${c[1]}</div><div class=l>${c[0]}</div></div>`).join('');
+  if(s.clients)ct.tBodies[0].innerHTML=s.clients.sort((a,b)=>(b.blocked+b.allowed)-(a.blocked+a.allowed)).map(c=>
+  `<tr><td>${esc(c.ip)}${c.banned?' <span class=tag style=color:#f85149>BANNED</span>':''}</td><td>${esc(c.mac)}</td>
+  <td class=b>${fmt(c.blocked)}</td><td class=a>${fmt(c.allowed)}</td>
+  <td><button class=ban onclick="api('/ban?ip=${encodeURIComponent(c.ip)}').then(load).catch(alert)">${c.banned?'Unban':'Ban'}</button></td></tr>`).join('');
+  if(s.custom)cl.tBodies[0].innerHTML=s.custom.map(d=>`<tr><td>${esc(d)}</td><td style=text-align:right><button onclick="api('/unblock?d=${encodeURIComponent(d)}').then(load).catch(alert)">remove</button></td></tr>`).join('')||'<tr><td style=color:#8b949e>none yet</td></tr>';
+  if(document.activeElement!=uurl)uurl.value=s.upurl||'';
+  if(document.activeElement!=uiv)uiv.value=s.upiv||24;
+  ustat.textContent=s.upstat||'—';
+  sigst.textContent=((s.blsig||'unverified')+(s.sigreq?' — required':' — optional')+(s.keyid?' ('+s.keyid+')':''))||'—';
+  dhcpst.textContent=s.dhcp?'ON':'OFF';
+  dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
+  wifi.textContent=s.wifi||'—';
+  if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
+  if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;
+  if(s.hasOwnProperty('paused')){updatePauseUi(s.paused,s.pause_rem_s,s.pause_bypass_custom);}
+}
+function addDom(){let d=dom.value.trim();if(d){api('/addblock?d='+encodeURIComponent(d)).then(()=>{dom.value='';load()}).catch(e=>alert('Failed: '+e.message))}}
+function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;api('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24)).then(load).catch(e=>alert('Failed: '+e.message))}
+function fetchNow(){ustat.textContent='fetching...';api('/fetchnow').then(r=>r.text()).then(t=>{ustat.textContent=t;load()}).catch(e=>{ustat.textContent='err: '+e.message})}
+function toggleDhcp(){api('/dhcp').then(r=>r.text()).then(t=>{alert(t);load()}).catch(e=>alert('Failed: '+e.message))}
+function toggleSigReq(){api('/sigrequire').then(r=>r.text()).then(t=>{alert(t);load()}).catch(e=>alert('Failed: '+e.message))}
 function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.textContent='enter SSID';return}
-wmsg.textContent='saving...';fetch('/setwifi',{method:'POST',headers:Object.assign({'Content-Type':'application/x-www-form-urlencoded'},H()),body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
-function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch('/settxpower?p='+encodeURIComponent(p),{headers:H()}).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
-function savePs(){let m=pssel.value;psmsg.textContent='saving...';fetch('/setwifips?m='+encodeURIComponent(m),{headers:H()}).then(r=>r.text()).then(t=>{psmsg.textContent=t;setTimeout(()=>{psmsg.textContent='';load()},1500)})}
+wmsg.textContent='saving...';api('/setwifi',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;}).catch(e=>{wmsg.textContent='err: '+e.message;})}
+function saveAuth(){let u=newu.value.trim(),p=newp.value.trim();if(!u||!p){authmsg.textContent='enter username and password';return;}
+authmsg.textContent='saving...';api('/setauth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'u='+encodeURIComponent(u)+'&p='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{authmsg.textContent=t;setTimeout(()=>{authmsg.textContent='';},3000);}).catch(e=>{authmsg.textContent='err: '+e.message;})}
+function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';api('/settxpower?p='+encodeURIComponent(p)).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)}).catch(e=>{txmsg.textContent='err: '+e.message;})}
+function savePs(){let m=pssel.value;psmsg.textContent='saving...';api('/setwifips?m='+encodeURIComponent(m)).then(r=>r.text()).then(t=>{psmsg.textContent=t;setTimeout(()=>{psmsg.textContent='';load()},1500)}).catch(e=>{psmsg.textContent='err: '+e.message;})}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
-try{let r=await fetch('/update',{method:'POST',headers:H(),body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
+try{let r=await api('/update',{method:'POST',body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
 catch(err){fwmsg.textContent='err: '+err.message;}};
 upf.onsubmit=async e=>{e.preventDefault();let f=blf.files[0];if(!f)return;
 upmsg.textContent='uploading '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);let g=sgf.files[0];if(g)fd.append('g',g);
-try{let r=await fetch('/upload',{method:'POST',headers:H(),body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
+try{let r=await api('/upload',{method:'POST',body:fd});upmsg.textContent=r.ok?await r.text():'failed: '+await r.text();}
 catch(_){upmsg.textContent='upload failed';}
 blf.value='';sgf.value='';setTimeout(load,600);};
+let pauseRemainingSec=0;
+function setPreset(m){pmin.value=m;}
+function fmtDuration(s){
+  if(s<=0)return '0s';
+  let m=Math.floor(s/60),rem=s%60;
+  if(m>=60){let h=Math.floor(m/60);m=m%60;return h+'h '+m+'m '+rem+'s';}
+  return (m>0?(m+'m '):'')+rem+'s';
+}
+function updatePauseUi(isPaused,remSec,bypassCustom){
+  pauseRemainingSec=remSec||0;
+  if(isPaused){
+    pnbanner.classList.add('paused');
+    pactive_box.style.display='none';
+    ppaused_box.style.display='block';
+    pscope.textContent=bypassCustom?'Custom domains: bypassed':'Custom domains: still blocked';
+    prem.textContent=(remSec>0)?fmtDuration(remSec):'Indefinite (until resumed)';
+  }else{
+    pnbanner.classList.remove('paused');
+    pactive_box.style.display='block';
+    ppaused_box.style.display='none';
+  }
+}
+function pauseBlocking(){
+  let m=parseInt(pmin.value);
+  if(isNaN(m)||m<0)m=5;
+  let c=pcust.checked?1:0;
+  api('/pause?m='+m+'&custom='+c).then(()=>load()).catch(e=>alert('Failed to pause: '+e.message));
+}
+function resumeBlocking(){
+  api('/resume').then(()=>load()).catch(e=>alert('Failed to resume: '+e.message));
+}
+setInterval(()=>{
+  if(pauseRemainingSec>0){
+    pauseRemainingSec--;
+    prem.textContent=fmtDuration(pauseRemainingSec);
+    if(pauseRemainingSec===0)load();
+  }
+},1000);
 load();setInterval(load,3000);
 </script></body></html>)HTML";
 
