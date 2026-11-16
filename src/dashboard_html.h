@@ -69,7 +69,7 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
 <header>
   <div class=brand>
     <h1><span>C3</span> AdBlock</h1>
-    <span class=badge id=fwver>v1.2.1</span>
+    <span class=badge id=fwver>v1.3.0</span>
   </div>
   <span class=host-pill id=host></span>
 </header>
@@ -81,6 +81,27 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
     <div class=table-wrap>
       <table id=ct><thead><tr><th>Client IP</th><th>MAC Address</th><th>Blocked</th><th>Allowed</th><th>Action</th></tr></thead><tbody></tbody></table>
     </div>
+  </div>
+
+  <div class=panel>
+    <div class=panel-head><h2>Blocking</h2><span id=blkst class=tag></span></div>
+    <div class="row row-full">
+      <button onclick=pauseBlock(300)>Pause 5 min</button>
+      <button onclick=pauseBlock(0)>Pause</button>
+      <button class=primary onclick=resumeBlock()>Resume</button>
+      <span class=hint style="margin:0">Banned clients stay blocked while paused.</span>
+    </div>
+    <hr class=div>
+    <div style="font-weight:600;font-size:11px;color:#8b949e;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Upstream DNS</div>
+    <div class="row row-full" style="margin-bottom:6px">
+      <input id=dnsip placeholder="9.9.9.9" class=flex-1 style="font-family:monospace">
+      <div class=inline-controls>
+        <button onclick=setDnsCustom()>Use IP</button>
+        <button onclick=setDnsRouter()>Router</button>
+        <button onclick=setDnsReset()>Default</button>
+      </div>
+    </div>
+    <div class=hint>Current: <span id=dnsnow style="color:#c9d1d9">—</span> <span id=dnssrc style="color:#8b949e"></span></div>
   </div>
 
   <div class=panel>
@@ -160,6 +181,9 @@ footer a{color:#58a6ff;text-decoration:none}footer a:hover{text-decoration:under
       <button onclick=saveWifi()>Change WiFi</button>
       <span id=wmsg style=color:#8b949e></span>
     </div>
+    <div class="row row-full" style="margin-top:6px">
+      <button onclick="if(confirm('Forget WiFi and reboot into setup portal?'))fetch('/forgetwifi',{headers:H()}).then(load)">Forget WiFi (setup portal)</button>
+    </div>
   </div>
 
   <div class=panel>
@@ -200,7 +224,7 @@ T=s.token||'';
 host.textContent='@ '+s.ip;
 if(s.version)fwver.textContent='v'+s.version;
 sys.innerHTML=[['Total blocked',fmt(s.blocked),'b'],['Total allowed',fmt(s.allowed),'a'],['Blocklist',fmt(s.domains)+' domains',''],
-['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.2.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
+['WiFi Signal',s.rssi+' dBm',''],['Temp',s.temp+' C',''],['TX Power',(s.txpower||'8.5')+' dBm',''],['Firmware','v'+(s.version||'1.3.0')+(s.single_app?' (single-app)':''),''],['Free RAM',Math.round(s.heap/1024)+' KB',''],['Uptime',s.uptime,''],
 ['FS',s.fstotal?Math.round(s.fsused/1024)+' / '+Math.round(s.fstotal/1024)+' KB':'—',''],
 ['Clients',s.clients.length,''],['Pending',s.pending||0,''],['Bloom',s.bloom||'off',''],
 ['Blocklist sig',(s.blsig||'unverified')+(s.sigreq?' (required)':''),'']]
@@ -218,7 +242,11 @@ dhcpst.textContent=s.dhcp?'ON':'OFF';
 dhcpst.style.color=s.dhcp?'#3fb950':'#8b949e';
 wifi.textContent=s.wifi||'—';
 if(document.activeElement!=txsel && s.txpower)txsel.value=s.txpower;
-if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;}
+if(document.activeElement!=pssel && s.wifips)pssel.value=s.wifips;
+blkst.textContent=s.blocking?'ON':'PAUSED'+(s.resumeIn?' ('+s.resumeIn+'s)':'');
+blkst.style.color=s.blocking?'#3fb950':'#f85149';
+dnsnow.textContent=s.dns||'—';dnssrc.textContent=s.dnsSource?'('+s.dnsSource+')':'';
+if(document.activeElement!=dnsip && s.dns)dnsip.placeholder=s.dns;}
 function addDom(){let d=dom.value.trim();if(d){fetch('/addblock?d='+encodeURIComponent(d),{headers:H()}).then(()=>{dom.value='';load()})}}
 function saveUpd(){let u=uurl.value.trim();if(u&&u.indexOf('://')<0)u='https://'+u;fetch('/setupdate?u='+encodeURIComponent(u)+'&h='+(parseInt(uiv.value)||24),{headers:H()}).then(load)}
 function fetchNow(){ustat.textContent='fetching...';fetch('/fetchnow',{headers:H()}).then(r=>r.text()).then(t=>{ustat.textContent=t;load()})}
@@ -228,6 +256,11 @@ function saveWifi(){let s=wssid.value.trim(),p=wpass.value.trim();if(!s){wmsg.te
 wmsg.textContent='saving...';fetch('/setwifi',{method:'POST',headers:Object.assign({'Content-Type':'application/x-www-form-urlencoded'},H()),body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)}).then(r=>r.text()).then(t=>{wmsg.textContent=t;})}
 function saveTxPower(){let p=txsel.value;txmsg.textContent='saving...';fetch('/settxpower?p='+encodeURIComponent(p),{headers:H()}).then(r=>r.text()).then(t=>{txmsg.textContent=t;setTimeout(()=>{txmsg.textContent='';load()},1000)})}
 function savePs(){let m=pssel.value;psmsg.textContent='saving...';fetch('/setwifips?m='+encodeURIComponent(m),{headers:H()}).then(r=>r.text()).then(t=>{psmsg.textContent=t;setTimeout(()=>{psmsg.textContent='';load()},1500)})}
+function pauseBlock(s){fetch('/pause'+(s?'?s='+s:''),{headers:H()}).then(load)}
+function resumeBlock(){fetch('/resume',{headers:H()}).then(load)}
+function setDnsCustom(){let v=dnsip.value.trim();if(!v)return;fetch('/setdns?ip='+encodeURIComponent(v),{headers:H()}).then(r=>r.text()).then(t=>{if(t&&t.indexOf('.')>0)dnsip.value='';load()})}
+function setDnsRouter(){fetch('/setdns?router=1',{headers:H()}).then(load)}
+function setDnsReset(){fetch('/setdns?reset=1',{headers:H()}).then(load)}
 fwf.onsubmit=async e=>{e.preventDefault();let f=fwb.files[0];if(!f)return;fwmsg.textContent='flashing '+(f.size/1048576).toFixed(2)+' MB...';
 let fd=new FormData();fd.append('f',f);
 try{let r=await fetch('/update',{method:'POST',headers:H(),body:fd});let txt=await r.text();fwmsg.textContent=r.ok?txt:'failed: '+txt;}
@@ -240,25 +273,3 @@ catch(_){upmsg.textContent='upload failed';}
 blf.value='';sgf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
 </script></body></html>)HTML";
-
-const char PORTAL_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>C3 AdBlock Setup</title><style>
-*{box-sizing:border-box}
-body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
-.wrap{padding:24px 20px;max-width:380px;margin:40px auto}
-.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:22px}
-input{width:100%;margin:6px 0 14px;padding:10px 12px;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;font-size:14px}
-input:focus{border-color:#58a6ff;outline:none}
-button{width:100%;padding:11px;background:#238636;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600}
-button:hover{background:#2ea043}
-h1{font-size:19px;margin:0 0 6px;color:#f0f6fc}h1 span{color:#3fb950}p{color:#8b949e;font-size:13px;margin:0 0 16px}
-</style></head><body><div class=wrap><div class=card>
-<h1><span>C3</span> AdBlock Setup</h1>
-<p>Connect this device to your WiFi network.</p>
-<form action=/save-wifi method=post>
-<label style="font-size:12px;color:#8b949e">WiFi Network (SSID)</label>
-<input name=ssid placeholder="Enter SSID" required>
-<label style="font-size:12px;color:#8b949e">WiFi Password</label>
-<input name=pass type=password placeholder="Enter password" required>
-<button>Connect to WiFi</button>
-</form></div></div></body></html>)HTML";

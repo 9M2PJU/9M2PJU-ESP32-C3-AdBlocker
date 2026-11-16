@@ -8,13 +8,19 @@
 //
 // Improvements over the original:
 //  - Async DNS forwarding (no more blocking on upstream replies)
-//  - Bloom filter pre-filter in RAM
+//  - Bloom filter pre-filter in RAM + small hot-domain cache
 //  - AAAA sinkhole (blocked IPv6 queries answered with ::, not leaked)
 //  - TCP DNS on port 53
 //  - Dashboard auth (Basic Auth + header CSRF token + brute-force brake)
+//  - Network OTA gated by dashboard password
 //  - Signed blocklist updates (ECDSA P-256, optional enforcement)
+//  - Configurable upstream DNS (built-in Quad9 / router / custom, persisted)
+//  - Pause/resume blocking (Pi-hole-style disable with auto-resume)
 //  - Client table with LRU eviction
 //  - Decoupled ban storage (independent of client table)
+//  - BOOT-button WiFi reset + robust captive portal (scan, escaping, retry)
+//  - TX-power fallback to 8.5 dBm on SuperMini antenna quirk
+//  - Upstream reply validation (source + txid) + sorted-list validation
 //  - Idle-gated remote blocklist fetch (deferred until DNS is quiet;
 //    the download itself still blocks DNS — schedule off-peak)
 //  - HTTPS with redirect-following for remote blocklist (no CA verification;
@@ -54,7 +60,8 @@
 #include "blocklist_pubkey.h"
 
 // ---- config ----
-static const IPAddress UPSTREAM(9, 9, 9, 9);
+static const IPAddress UPSTREAM_FALLBACK(9, 9, 9, 9);  // Quad9 (compile-time fallback)
+static IPAddress upstreamDns;            // runtime upstream, see upstreamApply()
 static const uint16_t DNS_PORT = 53;
 static const uint16_t DHCP_PORT = 67;
 static const char* BLOCKLIST_PATH = "/blocklist.bin";
@@ -70,8 +77,54 @@ static const int MAX_BAN = 32;
 static const int MAX_DHCP_LEASES = 32;
 static const uint32_t UPSTREAM_TIMEOUT_MS = 2000;
 static const uint32_t REMOTE_FETCH_IDLE_MS = 3000;  // only fetch when DNS idle this long
-static const char* FIRMWARE_VERSION = "1.2.1";
+static const char* FIRMWARE_VERSION = "1.3.0";
 static const String DASHBOARD_ETAG = String("c3adb-v") + FIRMWARE_VERSION;
+
+// ---- upstream resolver (built-in / router / custom) ----
+// Allowed lookups forward to built-in Quad9 by default. "router" uses the
+// DHCP-provided DNS (or gateway), "custom" uses a dashboard-set IPv4.
+// Persisted in /upstream.cfg ("router" or IPv4; absent = built-in).
+enum UpstreamMode { UP_BUILTIN, UP_ROUTER, UP_CUSTOM };
+static UpstreamMode upstreamMode = UP_BUILTIN;
+static IPAddress upstreamSaved;
+static const char* upstreamSource = "built-in";
+
+static bool usableResolver(const IPAddress& ip) {
+  return (uint32_t)ip != 0 && (uint32_t)ip != 0xFFFFFFFF;
+}
+static void upstreamApply() {
+  const IPAddress self = WiFi.localIP();
+  if (upstreamMode == UP_CUSTOM && usableResolver(upstreamSaved) && upstreamSaved != self) {
+    upstreamDns = upstreamSaved; upstreamSource = "custom"; return;
+  }
+  if (upstreamMode == UP_ROUTER) {
+    const IPAddress dhcp = WiFi.dnsIP(), gw = WiFi.gatewayIP();
+    if (usableResolver(dhcp) && dhcp != self) { upstreamDns = dhcp; upstreamSource = "router (dhcp)"; return; }
+    if (usableResolver(gw) && gw != self) { upstreamDns = gw; upstreamSource = "router (gateway)"; return; }
+  }
+  upstreamDns = UPSTREAM_FALLBACK; upstreamSource = "built-in";
+}
+static void upstreamLoad() {
+  upstreamMode = UP_BUILTIN;
+  File f = LittleFS.open("/upstream.cfg", "r");
+  if (f) {
+    String l = f.readStringUntil('\n'); l.trim(); f.close();
+    IPAddress ip;
+    if (l == "router") upstreamMode = UP_ROUTER;
+    else if (l.length() && ip.fromString(l) && usableResolver(ip)) {
+      upstreamSaved = ip; upstreamMode = UP_CUSTOM;
+    }
+  }
+  upstreamDns = UPSTREAM_FALLBACK;
+  upstreamApply();
+}
+static void upstreamSave() {
+  if (upstreamMode == UP_BUILTIN) { LittleFS.remove("/upstream.cfg"); return; }
+  File f = LittleFS.open("/upstream.cfg", "w");
+  if (!f) return;
+  f.println(upstreamMode == UP_ROUTER ? String("router") : upstreamSaved.toString());
+  f.close();
+}
 
 // ---- WiFi TX power & thermal configuration ----
 struct TxPowerOpt {
@@ -174,6 +227,10 @@ String updateUrl, updateStatus = "never";
 uint32_t updateIntervalH = 24, lastCheckMs = 0;
 static uint32_t lastDnsActivityMs = 0;
 bool dhcpEnabled = false;
+
+// ---- blocking pause (Pi-hole-style "disable for a while") ----
+static bool blockingOn = true;
+static uint32_t resumeAt = 0;  // millis() to auto-resume; 0 = paused indefinitely
 static void saveDhcpCfg();
 static void saveWifiCfg(const String& ssid, const String& pass);
 static bool fetchBlocklist(String url);
@@ -247,6 +304,34 @@ static bool inFlash(uint64_t h) {
   return false;
 }
 
+// ---- small direct-mapped flash-result cache (hot domains) ----
+// The flash list only changes via reopenBlocklist(), which clears this.
+// Custom domains change at runtime, so they are checked before the cache.
+static const int FLASH_CACHE_SIZE = 256;  // must be power of 2
+static uint8_t cacheKey[256][5];
+static uint8_t cacheRes[256];
+static uint8_t cacheValid[256];
+static void cacheClear() { memset(cacheValid, 0, sizeof(cacheValid)); }
+static inline void packHash40(uint64_t h, uint8_t* b) {
+  for (int k = 0; k < HASH_BYTES; k++) { b[k] = (uint8_t)h; h >>= 8; }
+}
+static bool inFlashCached(uint64_t h) {
+  uint32_t slot = (uint32_t)h & (FLASH_CACHE_SIZE - 1);
+  if (cacheValid[slot]) {
+    uint8_t want[HASH_BYTES];
+    packHash40(h, want);
+    bool same = true;
+    for (int k = 0; k < HASH_BYTES; k++)
+      if (cacheKey[slot][k] != want[k]) { same = false; break; }
+    if (same) return cacheRes[slot] != 0;
+  }
+  bool res = inFlash(h);
+  cacheValid[slot] = 1;
+  cacheRes[slot] = res ? 1 : 0;
+  packHash40(h, cacheKey[slot]);
+  return res;
+}
+
 // ---- custom domains (sorted for binary search) ----
 String customDom[MAX_CUSTOM];
 uint64_t customHash[MAX_CUSTOM];  // kept sorted
@@ -284,7 +369,7 @@ static bool isBlocked(const char* domain, size_t dlen) {
     bool checkFlash = bloomMayContain(h64);  // false = definitely not in list, skip flash
     if (checkFlash) flashChecks++;
     else bloomMisses++;
-    if (checkFlash && (inFlash(h40) || inCustom(h40))) return true;
+    if (checkFlash && (inFlashCached(h40) || inCustom(h40))) return true;
     const char* dot = (const char*)memchr(p, '.', remaining);
     if (!dot) break;
     size_t consumed = (size_t)(dot - p) + 1;
@@ -479,8 +564,12 @@ static void expirePending() {
 static bool pollUpstream(uint8_t* buf, int bufSize) {
   int sz = upstream.parsePacket();
   if (sz <= 0) return false;
+  // Only accept replies from the configured upstream: a LAN device could
+  // otherwise inject answers into the pending table.
+  bool fromUp = (upstream.remoteIP() == upstreamDns && upstream.remotePort() == DNS_PORT);
   int rlen = upstream.read(buf, bufSize);
   if (rlen < 2) return true;
+  if (!fromUp) return true;  // drained, not relayed
   uint16_t replyID = (buf[0] << 8) | buf[1];
   if (replyID >= MAX_PENDING || !pending[replyID].active) return true;
   // Restore original query ID
@@ -510,7 +599,7 @@ static bool handleDns() {
 
   Dev* c = getClient((uint32_t)cip);
   bool ban = c && c->banned;
-  bool blocked = ban || (dl && numHashes && isBlocked(domain, dl));
+  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain, dl));
 
   if (blocked) {
     int rlen = buildBlocked(dnsBuf, qend, qtype);
@@ -531,7 +620,7 @@ static bool handleDns() {
     pending[slot].sentMs = millis();
     pending[slot].active = true;
     pendingCount++;
-    upstream.beginPacket(UPSTREAM, 53);
+    upstream.beginPacket(upstreamDns, DNS_PORT);
     upstream.write(dnsBuf, qlen);
     upstream.endPacket();
     totalAllowed++;
@@ -547,8 +636,13 @@ static uint8_t tcpBuf[DNS_BUF_SIZE];
 
 static int forwardUpstreamSync(uint8_t* pkt, int qlen) {
   uint16_t origID = (pkt[0] << 8) | pkt[1];
-  pkt[0] = 0xFF; pkt[1] = 0xFE;  // use fixed ID to avoid collision with UDP slots 0-31
-  tcpUpstream.beginPacket(UPSTREAM, 53);
+  // Random ID outside the UDP slot range (0-31) to avoid collision.
+  uint16_t wid = (uint16_t)(0x100 | (esp_random() & 0xFEFF));
+  if (wid < MAX_PENDING) wid |= 0x100;
+  // Drain stale datagrams so a late reply is not relayed to this query.
+  while (tcpUpstream.parsePacket() > 0) { uint8_t d[64]; tcpUpstream.read(d, sizeof(d)); }
+  pkt[0] = (wid >> 8) & 0xFF; pkt[1] = wid & 0xFF;
+  tcpUpstream.beginPacket(upstreamDns, DNS_PORT);
   tcpUpstream.write(pkt, qlen);
   tcpUpstream.endPacket();
   pkt[0] = (origID >> 8) & 0xFF; pkt[1] = origID & 0xFF;  // restore for blocked path
@@ -556,12 +650,12 @@ static int forwardUpstreamSync(uint8_t* pkt, int qlen) {
   while (millis() - t0 < UPSTREAM_TIMEOUT_MS) {
     int sz = tcpUpstream.parsePacket();
     if (sz > 0) {
+      bool fromUp = (tcpUpstream.remoteIP() == upstreamDns && tcpUpstream.remotePort() == DNS_PORT);
       int n = tcpUpstream.read(pkt, DNS_BUF_SIZE);
-      if (n >= 2) {
-        pkt[0] = (origID >> 8) & 0xFF; pkt[1] = origID & 0xFF;
-        return n;
-      }
-      return 0;
+      if (!fromUp || n < 2) continue;
+      if (((pkt[0] << 8) | pkt[1]) != wid) continue;  // not ours
+      pkt[0] = (origID >> 8) & 0xFF; pkt[1] = origID & 0xFF;
+      return n;
     }
     // Keep UDP DNS alive while waiting: drain one UDP query/reply per
     // iteration instead of stalling the whole server for up to 2 s.
@@ -606,7 +700,7 @@ static bool handleTcpDns() {
   size_t dl = parseQuery(tcpBuf, total, domain, &qtype, &qend);
   Dev* c = getClient((uint32_t)tcpDnsClient.remoteIP());
   bool ban = c && c->banned;
-  bool blocked = ban || (dl && numHashes && isBlocked(domain, dl));
+  bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain, dl));
 
   int rlen;
   if (blocked) {
@@ -864,6 +958,22 @@ static String jesc(const String& s) {
   for (char ch : s) { if (ch == '"' || ch == '\\') o += '\\'; o += ch; }
   return o;
 }
+// HTML escaping for the setup portal (scanned SSIDs are attacker-controllable).
+static String htmlEscape(const String& s) {
+  String o;
+  o.reserve(s.length());
+  for (char ch : s) {
+    switch (ch) {
+      case '&': o += "&amp;"; break;
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '"': o += "&quot;"; break;
+      case '\'': o += "&#39;"; break;
+      default: o += ch;
+    }
+  }
+  return o;
+}
 
 static void handleRoot() {
   if (!checkAuth()) { requireAuth(); return; }
@@ -918,6 +1028,9 @@ static void handleStats() {
              ",\"token\":\"" + jesc(authToken) + "\"" +
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"upiv\":" + updateIntervalH +
              ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
+             ",\"dns\":\"" + upstreamDns.toString() + "\",\"dnsSource\":\"" + upstreamSource + "\"" +
+             ",\"blocking\":" + (blockingOn ? "true" : "false") +
+             ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"txpower\":\"" + txPowerSetting + "\"" +
              ",\"wifips\":\"" + wifiPsSetting + "\"" +
              ",\"blsig\":\"" + (blSigned ? "signed" : "unverified") + "\"" +
@@ -1032,7 +1145,7 @@ static void loadBloomFromBlocklist(File& f) {
   bloomK = k;
   hashTableOffset = BL_HEADER_SIZE + bloomBytes;
   // New list -> reset runtime counters and refresh theory estimate.
-  bloomChecks = 0; bloomMisses = 0; flashChecks = 0;
+  bloomChecks = 0; bloomMisses = 0; flashChecks = 0; cacheClear();
   bloomFprTheory = bloomTheoryFpr(numHashes, bloomBits, bloomK);
   if (bloomBits > 0 && bloomK > 0) {
     bloomFilter = (uint8_t*)malloc(bloomBytes);
@@ -1199,7 +1312,32 @@ static bool commitNewBlocklist() {
         uint32_t nh = hdr[6] | (hdr[7] << 8) | (hdr[8] << 16) | (hdr[9] << 24);
         uint32_t bb = hdr[10] | (hdr[11] << 8) | (hdr[12] << 16) | (hdr[13] << 24);
         size_t expected = BL_HEADER_SIZE + (bb + 7) / 8 + (size_t)nh * HASH_BYTES;
-        if (sz == expected && nh > 0) ok = true;
+        if (sz == expected && nh > 0) {
+          // Strictly-ascending check: rejects HTML error pages and corrupt
+          // feeds that happen to have the right size. Streams in chunks so
+          // large lists never load into RAM.
+          size_t hashOff = BL_HEADER_SIZE + (bb + 7) / 8;
+          chk.seek(hashOff);
+          uint8_t chunk[500];
+          uint64_t prev = 0;
+          bool first = true, sorted = true;
+          size_t seen = 0;
+          while (seen < nh && sorted) {
+            size_t want = (size_t)(nh - seen) * HASH_BYTES;
+            if (want > sizeof(chunk)) want = sizeof(chunk) - (sizeof(chunk) % HASH_BYTES);
+            int n = chk.read(chunk, want);
+            if (n <= 0) { sorted = false; break; }
+            for (int k = 0; k + HASH_BYTES <= n; k += HASH_BYTES) {
+              uint64_t v = 0;
+              for (int b = 0; b < HASH_BYTES; b++) v |= (uint64_t)chunk[k + b] << (8 * b);
+              if (!first && v <= prev) { sorted = false; break; }
+              prev = v; first = false; seen++;
+            }
+            if ((size_t)n < want && seen < nh) { sorted = false; break; }
+          }
+          if (sorted && seen == nh) ok = true;
+          else { LOGN("[bl] not a sorted blocklist — rejecting"); swapStatus = "not a sorted blocklist"; }
+        }
         else if (nh == 0) { LOGN("[bl] rejecting empty blocklist"); swapStatus = "empty blocklist"; }
         else {
           // Short write: almost always a full LittleFS (the swap stages
@@ -1760,6 +1898,24 @@ static bool connectWiFi() {
     }
     return true;
   }
+  // Some C3 SuperMini boards have a badly matched antenna and only work at
+  // reduced TX power: if full power didn't connect, retry once at 8.5 dBm.
+  LOGN("\nWiFi connect failed — retrying once at 8.5 dBm (SuperMini antenna quirk)");
+  WiFi.disconnect(false, true);
+  delay(200);
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  WiFi.begin(trySsid, tryPass);
+  t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 20000) {
+    delay(300); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0)) {
+    LOG("\nWiFi up (8.5dBm fallback): %s rssi:%d\n",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    applyWifiPs(wifiPsSetting);
+    return true;
+  }
   LOGN("\nWiFi connect failed");
   WiFi.disconnect(false);
   return false;
@@ -1824,13 +1980,51 @@ static void handleCaptiveDns() {
   }
 }
 
+static String portalOpts;
+
+static String portalPage() {
+  String html =
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>C3 AdBlock setup</title>"
+    "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
+    "<h2>C3 AdBlock - WiFi setup</h2>"
+    "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
+    "<form method=POST action=/save-wifi>"
+    "<select name=s style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
+    + portalOpts +
+    "</select>"
+    "<input name=s2 placeholder='or type the WiFi name' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
+    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
+    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px'>Connect</button>"
+    "</form></body>";
+  return html;
+}
+
 static void runCaptivePortal() {
+  // Bring the radio up before the first scan: an unconfigured device gets
+  // here with no STA state, and the first scan right after boot can come
+  // back empty. Retry a few times so the network list is populated.
+  WiFi.mode(WIFI_STA);
+  delay(200);
+  int n = 0;
+  for (int attempt = 1; attempt <= 3 && n <= 0; attempt++) {
+    if (attempt > 1) delay(700);
+    n = WiFi.scanNetworks();
+    LOG("[setup] scan %d/3: %d networks\n", attempt, n);
+  }
+  portalOpts = "<option value=''>-- pick your network --</option>";
+  for (int i = 0; i < n && i < 15; i++) {
+    String s = WiFi.SSID(i);
+    portalOpts += "<option value='" + htmlEscape(s) + "'>" + htmlEscape(s) + "</option>";
+  }
+  String tmpSsid, tmpPass;
+  bool configured = loadWifiCfg(tmpSsid, tmpPass);
   WiFi.mode(WIFI_AP);
   WiFi.softAP("C3AdBlock-Setup");
-  applyTxPower(txPowerSetting);
+  // Phone is next to the device; low TX avoids the SuperMini antenna quirk.
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   LOGN("\n[captive] AP: C3AdBlock-Setup — connect and open http://192.168.4.1");
   captiveDns.begin(53);
-  web.on("/", []() { web.send(200, "text/html", PORTAL_HTML); });
   auto portalRedirect = []() { web.sendHeader("Location", "http://192.168.4.1/", true); web.send(302, "text/plain", ""); };
   web.on("/generate_204", []() { web.send(204); });  // Android
   web.on("/connecttest.txt", portalRedirect);        // Windows
@@ -1838,21 +2032,35 @@ static void runCaptivePortal() {
   web.on("/ncsi.txt", portalRedirect);               // Windows
   web.on("/hotspot-detect.html", portalRedirect);    // iOS / macOS
   web.on("/library/test/success.html", portalRedirect);  // iOS
-  web.onNotFound([]() { web.send(200, "text/html", PORTAL_HTML); });
+  web.on("/", []() { web.send(200, "text/html", portalPage()); });
+  web.onNotFound([]() { web.send(200, "text/html", portalPage()); });
   web.on("/save-wifi", HTTP_POST, []() {
-    String ssid = web.arg("ssid");
-    String pass = web.arg("pass");
+    String ssid = web.arg("s2"); ssid.trim();  // typed name wins
+    if (!ssid.length()) ssid = web.arg("s");   // otherwise the picked one
+    String pass = web.arg("p");
+    // Back-compat with the old static portal form (ssid/pass fields).
+    if (!ssid.length()) ssid = web.arg("ssid");
+    if (!pass.length()) pass = web.arg("pass");
     if (ssid.length() == 0) { web.send(400, "text/html", "<h1>Missing SSID</h1>"); return; }
     saveWifiCfg(ssid, pass);
-    web.send(200, "text/html", "<h1>Saved! Rebooting...</h1><p>Connect to your WiFi and find the device at c3adblock.local</p>");
+    web.send(200, "text/html", "<h1>Saved! Rebooting...</h1><p>Joining <b>" + htmlEscape(ssid) +
+             "</b> — reconnect your phone to your WiFi, then find the box at <b>c3adblock.local</b></p>");
     delay(1500);
     ESP.restart();
   });
   web.begin();
 
+  uint32_t portalT0 = millis();
   while (true) {
     web.handleClient();
     handleCaptiveDns();
+    if (WiFi.softAPgetStationNum() > 0) portalT0 = millis();  // someone is setting it up
+    // A configured device that merely failed to join (router rebooting)
+    // must not get stuck here: reboot and retry WiFi after 3 min idle.
+    if (configured && (millis() - portalT0) > 180000UL) {
+      LOGN("[setup] retrying WiFi");
+      ESP.restart();
+    }
     delay(2);
   }
 }
@@ -1888,9 +2096,20 @@ void setup() {
   loadTxPowerCfg();
   loadWifiPsCfg();
   loadSigReq();
+  upstreamLoad();
   reopenBlocklist();
-  LOG("[cfg] custom:%d banned:%d auth:%s txpower:%s wifips:%s\n", numCustom, numBanned, authPassword.c_str(), txPowerSetting.c_str(), wifiPsSetting.c_str());
+  LOG("[cfg] custom:%d banned:%d auth:%s txpower:%s wifips:%s upstream:%s\n", numCustom, numBanned, authPassword.c_str(), txPowerSetting.c_str(), wifiPsSetting.c_str(), upstreamDns.toString().c_str());
   LOGN("[cfg] dashboard password: " + authPassword);
+
+  // Hold BOOT (GPIO9 on C3) at power-on to wipe saved WiFi and force the portal.
+  pinMode(9, INPUT_PULLUP);
+  if (digitalRead(9) == LOW) {
+    delay(60);
+    if (digitalRead(9) == LOW) {
+      LittleFS.remove("/wifi.cfg");
+      LOGN("[setup] BOOT held -> cleared saved WiFi");
+    }
+  }
 
   // Log the driver-level disconnect reason so "connection lost after a
   // while" stops being a mystery (auth fail? AP took us down? beacon loss?).
@@ -1904,6 +2123,8 @@ void setup() {
     runCaptivePortal();  // blocks forever (reboots on save)
     return;
   }
+  upstreamApply();  // DHCP is up now (matters for "router" mode)
+  LOG("[dns] upstream: %s (%s)\n", upstreamDns.toString().c_str(), upstreamSource);
 
   if (MDNS.begin("c3adblock")) {
     MDNS.addService("http", "tcp", 80);
@@ -1976,13 +2197,57 @@ void setup() {
   web.on("/dhcp", handleDhcpToggle);
   web.on("/setwifi", HTTP_POST, handleSetWifi);
   web.on("/sigrequire", handleSigRequire);
+  web.on("/pause", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
+    blockingOn = false;
+    resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
+    web.send(200, "text/plain", "paused");
+  });
+  web.on("/resume", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    blockingOn = true; resumeAt = 0;
+    web.send(200, "text/plain", "resumed");
+  });
+  web.on("/forgetwifi", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    web.send(200, "text/plain", "cleared — rebooting into setup portal");
+    LittleFS.remove("/wifi.cfg");
+    delay(500);
+    ESP.restart();
+  });
+  web.on("/setdns", []() {
+    if (!checkAuth()) { requireAuth(); return; }
+    if (!checkToken()) { web.send(403, "text/plain", "bad token"); return; }
+    if (web.hasArg("reset")) upstreamMode = UP_BUILTIN;
+    else if (web.hasArg("router")) upstreamMode = UP_ROUTER;
+    else {
+      IPAddress v;
+      if (!web.hasArg("ip") || !v.fromString(web.arg("ip"))) {
+        web.send(400, "text/plain", "not an IPv4 address");
+        return;
+      }
+      if (!usableResolver(v)) { web.send(400, "text/plain", "0.0.0.0 / broadcast is not a resolver"); return; }
+      if (v == WiFi.localIP()) { web.send(400, "text/plain", "that is this device; pick another resolver"); return; }
+      upstreamSaved = v; upstreamMode = UP_CUSTOM;
+    }
+    upstreamSave(); upstreamApply();
+    LOG("[dns] upstream -> %s (%s)\n", upstreamDns.toString().c_str(), upstreamSource);
+    web.send(200, "text/plain", upstreamDns.toString());
+  });
   // Silence the "[E][WebServer.cpp] request handler not found" spam from
   // browsers (favicon) and LAN scanners: explicit 204 + quiet 404.
   web.on("/favicon.ico", []() { web.send(204); });
   web.onNotFound([]() { web.send(404, "text/plain", "not found"); });
   web.begin();
 
+  // Network OTA was previously unauthenticated: anyone on the LAN could
+  // push firmware. Gate it with the dashboard password.
   ArduinoOTA.setHostname("c3adblock");
+  ArduinoOTA.setPassword(authPassword.c_str());
 #ifdef SINGLE_APP
   LOGN("single-app build: network firmware OTA disabled (flash over USB)");
 #else
@@ -2004,6 +2269,9 @@ void loop() {
 #endif
   web.handleClient();
   bool busy = false;
+  if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) {
+    blockingOn = true; resumeAt = 0;
+  }
   if (handleDns()) busy = true;
   if (pollUpstream(dnsBuf, DNS_BUF_SIZE)) busy = true;
   expirePending();
@@ -2024,6 +2292,7 @@ void loop() {
       busy = true;
       if (connectWiFi()) {
         wifiFailStreak = 0;
+        upstreamApply();  // DHCP lease may have changed (matters for router mode)
         rebindNetServices();  // sockets + mDNS go deaf across an outage
       } else if (++wifiFailStreak >= 12) {
         LOGN("[wifi] offline ~5 min, rebooting to recover radio");
