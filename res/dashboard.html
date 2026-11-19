@@ -1,8 +1,4 @@
-#pragma once
-// Dashboard HTML — served from PROGMEM with ETag/Cache-Control.
-// Split into its own header so main.cpp stays readable.
-
-const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
 <title>C3 AdBlock</title><style>
 *{box-sizing:border-box}
 body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;background:#0d1117;color:#c9d1d9}
@@ -272,4 +268,4 @@ try{let r=await fetch('/upload',{method:'POST',headers:H(),body:fd});upmsg.textC
 catch(_){upmsg.textContent='upload failed';}
 blf.value='';sgf.value='';setTimeout(load,600);};
 load();setInterval(load,3000);
-</script></body></html>)HTML";
+</script></body></html>

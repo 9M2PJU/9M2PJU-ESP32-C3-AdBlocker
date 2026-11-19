@@ -56,7 +56,7 @@
 #include "mbedtls/bignum.h"
 #include "mbedtls/version.h"
 #include "secrets.h"
-#include "dashboard_html.h"
+#include "resources.h"
 #include "blocklist_pubkey.h"
 
 // ---- config ----
@@ -980,7 +980,7 @@ static void handleRoot() {
   if (web.header("If-None-Match") == DASHBOARD_ETAG) { web.send(304); return; }
   web.sendHeader("Cache-Control", "max-age=3600");
   web.sendHeader("ETag", DASHBOARD_ETAG);
-  web.send_P(200, "text/html", PAGE);
+  web.send_P(200, "text/html", DASHBOARD_HTML);
 }
 
 // ---- blocklist signature state (verified in the signature section below) ----
@@ -1981,23 +1981,11 @@ static void handleCaptiveDns() {
 }
 
 static String portalOpts;
+static String portalHtml;  // res/portal.html rendered with the scanned SSIDs
 
-static String portalPage() {
-  String html =
-    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>C3 AdBlock setup</title>"
-    "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
-    "<h2>C3 AdBlock - WiFi setup</h2>"
-    "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
-    "<form method=POST action=/save-wifi>"
-    "<select name=s style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
-    + portalOpts +
-    "</select>"
-    "<input name=s2 placeholder='or type the WiFi name' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
-    "<input name=p type=password placeholder='Password' style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px'>"
-    "<button style='width:100%;padding:12px;margin-top:8px;border-radius:6px'>Connect</button>"
-    "</form></body>";
-  return html;
+static void renderPortal() {
+  portalHtml = PORTAL_HTML;
+  portalHtml.replace("{{WIFI_OPTIONS}}", portalOpts);
 }
 
 static void runCaptivePortal() {
@@ -2017,6 +2005,7 @@ static void runCaptivePortal() {
     String s = WiFi.SSID(i);
     portalOpts += "<option value='" + htmlEscape(s) + "'>" + htmlEscape(s) + "</option>";
   }
+  renderPortal();
   String tmpSsid, tmpPass;
   bool configured = loadWifiCfg(tmpSsid, tmpPass);
   WiFi.mode(WIFI_AP);
@@ -2032,8 +2021,8 @@ static void runCaptivePortal() {
   web.on("/ncsi.txt", portalRedirect);               // Windows
   web.on("/hotspot-detect.html", portalRedirect);    // iOS / macOS
   web.on("/library/test/success.html", portalRedirect);  // iOS
-  web.on("/", []() { web.send(200, "text/html", portalPage()); });
-  web.onNotFound([]() { web.send(200, "text/html", portalPage()); });
+  web.on("/", []() { web.send(200, "text/html", portalHtml); });
+  web.onNotFound([]() { web.send(200, "text/html", portalHtml); });
   web.on("/save-wifi", HTTP_POST, []() {
     String ssid = web.arg("s2"); ssid.trim();  // typed name wins
     if (!ssid.length()) ssid = web.arg("s");   // otherwise the picked one
