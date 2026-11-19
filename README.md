@@ -19,6 +19,14 @@ using **~180 KB of RAM** (including the 128 KB Bloom filter).
 ## What's new in this version
 
 ### Recent releases
+- **v1.3.0** — upstream catch-up: configurable upstream DNS
+  (built-in Quad9 / router / custom, `/setdns`, persisted in
+  `/upstream.cfg`); pause/resume blocking (`/pause?s=` + `/resume`,
+  auto-resume, banned clients stay blocked); BOOT-button WiFi reset +
+  robust portal (scan retry, SSID select, HTML escaping, 3-min retry);
+  TX-power 8.5 dBm fallback (SuperMini quirk); reply validation
+  (source + txid) + sorted-list check; network OTA now needs the
+  dashboard password; small hot-domain cache on top of Bloom.
 - **v1.2.0** — bloom observability + build-time FPR guard: firmware logs
   theory FPR at boot and exposes `bloomChecks/bloomMisses/flashChecks/
   bloomPass/bloomFprTheory` in `/stats.json`; `build_blocklist.py` gains

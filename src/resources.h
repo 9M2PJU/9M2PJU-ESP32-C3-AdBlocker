@@ -34,11 +34,9 @@
 #define IMPORT_BIN_DECL(sym) extern const uint8_t sym[]; extern const size_t sym_size;
 #define IMPORT_STR_DECL(sym) extern const char sym[];
 
-// ---- dashboard + captive portal (served by web.send_P) ----
+// ---- dashboard (served by web.send_P) ----
 IMPORT_FLASH_STR("res/dashboard.html", DASHBOARD_HTML);
-IMPORT_FLASH_STR("res/portal.html", PORTAL_HTML);
 IMPORT_STR_DECL(DASHBOARD_HTML);
-IMPORT_STR_DECL(PORTAL_HTML);
 
 // ---- images: same pattern, ready for the next step ----
 // Binary assets keep their size, so a handler can send them with an explicit
